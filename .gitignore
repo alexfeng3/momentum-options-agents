@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+logs/
+state/
+.pytest_cache/
+
+# Market data caches — regenerate with scripts/fetch_*.py
+data/broad/
+data/underlying/
+data/earnings/

@@ -1,0 +1,6 @@
+requests>=2.31
+python-dotenv>=1.0
+pytest>=8.0
+
+# Optional: enables the Judgment Agent. Without it the layer abstains.
+anthropic>=0.40
