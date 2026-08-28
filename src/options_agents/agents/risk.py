@@ -55,7 +55,7 @@ class RiskAgent:
         # Exits first: they free capital and reduce risk, so they are never blocked
         # by exposure or concentration limits.
         for p in [x for x in proposals if x.kind in ("EXIT", "TRIM")]:
-            out.append(self._exit(p, pf, prices, paper_verified, market_open))
+            out.append(self._exit(p, pf, prices, paper_verified, market_open, equity))
 
         held_after = dict(pf.shares)
         for d in out:
@@ -108,7 +108,8 @@ class RiskAgent:
         return out
 
     # ------------------------------------------------------------------ exits
-    def _exit(self, p, pf, prices, paper_verified, market_open) -> Decision:
+    def _exit(self, p, pf, prices, paper_verified, market_open,
+              equity: float = 0.0) -> Decision:
         chk = []
         if not paper_verified:
             return Decision(p.symbol, p.kind, "REJECT",
@@ -119,9 +120,32 @@ class RiskAgent:
         if held <= 0:
             return Decision(p.symbol, p.kind, "REJECT",
                             f"No {p.symbol} position to exit.", checks=chk)
+
+        if p.kind == "EXIT":
+            return Decision(p.symbol, p.kind, "APPROVE",
+                            "Exit approved — risk-reducing, not subject to exposure caps.",
+                            qty=held, checks=chk)
+
+        # TRIM sells only the EXCESS over target. Selling `held` here liquidates a
+        # position the model still wants to own, and the rebalance would buy it
+        # straight back next cycle, paying costs both ways.
+        px = prices.get(p.symbol)
+        if not px or not equity:
+            return Decision(p.symbol, p.kind, "REJECT",
+                            f"Cannot size a trim for {p.symbol} without a price "
+                            f"and account equity.", checks=chk)
+        target_val = equity * (p.target_weight or 0.0)
+        excess_val = held * px - target_val
+        if excess_val <= self.cfg.min_ticket:
+            return Decision(p.symbol, p.kind, "REJECT",
+                            f"Excess ${max(0.0, excess_val):,.2f} is below the "
+                            f"${self.cfg.min_ticket:,.0f} minimum ticket — leaving it.",
+                            checks=chk)
+        qty = min(held, excess_val / px)
         return Decision(p.symbol, p.kind, "APPROVE",
-                        f"Exit approved — risk-reducing, not subject to exposure caps.",
-                        qty=held, checks=chk)
+                        f"Trimming {qty:.4f} sh (${excess_val:,.2f}) back to the "
+                        f"${target_val:,.2f} target; keeping "
+                        f"{held - qty:.4f} sh.", qty=qty, checks=chk)
 
     # ---------------------------------------------------------------- entries
     def _entry(self, p, sim: Portfolio, prices, equity, n_open,

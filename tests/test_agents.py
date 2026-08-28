@@ -179,3 +179,34 @@ def test_risk_off_regime_exits_everything():
         snap, {"AAA": 100.0}, _Book(), date(2026, 8, 28),
         held_value={"AAA": 10_000.0}, equity=100_000.0)
     assert props and all(p.kind == "EXIT" for p in props)
+
+
+def test_trim_sells_only_the_excess_not_the_whole_position():
+    """A TRIM that liquidates the position would be bought straight back next
+    cycle, paying costs both ways."""
+    from options_agents.agents.strategy import Proposal as P
+    pf = Portfolio(cash=10_000.0, shares={"AAA": 900.0})
+    p = P("AAA", "TRIM", "SELL", 0.5, "trim to target", {})
+    d = risk().run([p], pf, {"AAA": 100.0}, 100_000,
+                   paper_verified=True, market_open=True)[0]
+    assert d.approved
+    assert d.qty == pytest.approx(400.0)      # 900 held, 500 target -> sell 400
+    assert d.qty < 900.0
+
+
+def test_trim_below_min_ticket_is_left_alone():
+    from options_agents.agents.strategy import Proposal as P
+    pf = Portfolio(cash=0.0, shares={"AAA": 501.0})
+    p = P("AAA", "TRIM", "SELL", 0.5, "trim", {})
+    d = risk().run([p], pf, {"AAA": 100.0}, 100_000,
+                   paper_verified=True, market_open=True)[0]
+    assert not d.approved and "minimum ticket" in d.reason
+
+
+def test_exit_still_sells_everything():
+    from options_agents.agents.strategy import Proposal as P
+    pf = Portfolio(cash=0.0, shares={"AAA": 900.0})
+    d = risk().run([P("AAA", "EXIT", "SELL", 0.0, "dropped out", {})], pf,
+                   {"AAA": 100.0}, 100_000, paper_verified=True,
+                   market_open=True)[0]
+    assert d.approved and d.qty == 900.0
