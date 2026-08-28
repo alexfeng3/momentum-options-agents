@@ -273,7 +273,10 @@ def equal_weight_universe(book: HistoricalBook, universe: list[str],
     last = None
     for d in days:
         if holdings:
-            val = sum(q * (book.close(s, d) or 0) for s, q in holdings.items())
+            # last traded price, not zero: delisted names are usually
+            # acquisitions that paid out, and zeroing them understates the
+            # benchmark that every strategy is measured against.
+            val = sum(q * (book.last_price(s, d) or 0) for s, q in holdings.items())
             val += holdings.get("__cash__", 0.0)
         if last is None or (d - last).days >= rebalance_days:
             live = [s for s in universe if book.close(s, d)]

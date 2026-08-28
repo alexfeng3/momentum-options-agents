@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from options_agents.marketdata import HistoricalBook
 from options_agents.metrics import spy_buy_hold, summarise
-from options_agents.selection import rank
+from options_agents.selection import rank, realised_vol
 from options_agents.tearsheet import render, tearsheet
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,28 +21,47 @@ BROAD = ROOT / "data" / "broad"
 
 
 def momentum(book, syms, S, E, top_n=6, rebal=21, market_filter=True,
-             start_equity=100_000.0, cost_bps=5.0):
+             start_equity=100_000.0, cost_bps=5.0, min_px=5.0,
+             max_vol=None, min_dv=0.0):
+    """Delisting is handled at LAST TRADED PRICE, not zero.
+
+    Marking a delisted holding to zero books total losses on acquisitions
+    (ATVI, VMW, XLNX, TWTR all just stop having bars) and manufactured a fake
+    -76% drawdown in an earlier version of this script.
+    """
     days = [d for d in book.days if S <= d <= E]
     cash, hold, last, curve = start_equity, {}, None, []
     for d in days:
-        val = cash + sum(q * (book.close(s, d) or 0) for s, q in hold.items())
+        val = cash + sum(q * (book.last_price(s, d) or 0) for s, q in hold.items())
         if last is None or (d - last).days >= rebal:
             ok = True
             if market_filter:
                 b = book.closes_until("SPY", d, 200)
                 ok = len(b) >= 200 and b[-1] > sum(b) / len(b)
             for s, q in list(hold.items()):
-                px = book.close(s, d)
+                px = book.last_price(s, d)
                 if px:
                     cash += q * px * (1 - cost_bps / 10_000)
-                else:                      # delisted mid-hold: mark to zero
-                    pass
             hold = {}
             cands = {}
             for s in syms:
+                if book.is_delisted(s, d):
+                    continue
                 c = book.closes_until(s, d, 300)
-                if len(c) >= 260 and c[-1] >= 5.0 and book.close(s, d):
-                    cands[s] = c
+                if len(c) < 260 or c[-1] < min_px or not book.close(s, d):
+                    continue
+                if max_vol is not None:
+                    rv = realised_vol(c, 60)
+                    if rv is None or rv > max_vol:
+                        continue
+                if min_dv > 0:
+                    rec = book.px[s]
+                    ds = [x for x in rec if x <= d][-20:]
+                    adv = sum(rec[x]["close"] * rec[x].get("volume", 0)
+                              for x in ds) / max(1, len(ds))
+                    if adv < min_dv:
+                        continue
+                cands[s] = c
             picks = rank(cands, book.closes_until("SPY", d, 300), top_n) if (cands and ok) else []
             if picks:
                 per = cash / len(picks)
@@ -57,11 +76,16 @@ def momentum(book, syms, S, E, top_n=6, rebal=21, market_filter=True,
 
 
 def equal_weight(book, syms, S, E, eq=100_000.0, rebal=63):
+    """Equal-weight buy-and-hold: the survivorship-bias control.
+
+    Delisted names are carried at LAST TRADED PRICE. Marking them to zero
+    understates the benchmark, which flatters every strategy measured against it.
+    """
     days = [d for d in book.days if S <= d <= E]
     hold, last, val, curve = {}, None, eq, []
     for d in days:
         if hold:
-            val = sum(q * (book.close(s, d) or 0) for s, q in hold.items())
+            val = sum(q * (book.last_price(s, d) or 0) for s, q in hold.items())
         if last is None or (d - last).days >= rebal:
             live = [s for s in syms if book.close(s, d)]
             if live:
@@ -86,11 +110,16 @@ def main():
     rows = [tearsheet(spy, spy, None, "SPY buy & hold"),
             tearsheet(equal_weight(bb, broad, S, E), spy, None, f"EW broad ({len(broad)})"),
             tearsheet(equal_weight(bb, narrow, S, E), spy, None, f"EW narrow ({len(narrow)})")]
-    for n in (6, 10, 20):
-        rows.append(tearsheet(momentum(bb, broad, S, E, top_n=n), spy, None,
-                              f"Momentum top-{n} BROAD"))
     rows.append(tearsheet(momentum(bb, narrow, S, E, top_n=6), spy, None,
-                          "Momentum top-6 narrow"))
+                          "Momentum top-6 NARROW*"))
+    rows.append(tearsheet(momentum(bb, broad, S, E, top_n=6), spy, None,
+                          "Momentum top-6 broad"))
+    rows.append(tearsheet(momentum(bb, broad, S, E, top_n=10, min_px=10,
+                                   max_vol=0.60, min_dv=50e6), spy, None,
+                          "top-10 $50M ADV vol<=60%"))
+    rows.append(tearsheet(momentum(bb, broad, S, E, top_n=10, min_px=10,
+                                   max_vol=0.50, min_dv=100e6), spy, None,
+                          "top-10 $100M ADV vol<=50%"))
     print("\n" + render(rows, f"UNIVERSE TEST  {S} -> {E}  (Alpaca IEX daily)"))
     return 0
 

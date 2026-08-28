@@ -29,10 +29,16 @@ because they went up.
 | Portfolio | Return | maxDD | Sharpe | Beta | Alpha (ann) |
 |---|---|---|---|---|---|
 | SPY buy & hold | +70.7% | −25.4% | 0.60 | 1.00 | — |
+| Equal-weight **951 names** (bias control) | +59.8% | −25.3% | 0.50 | 0.98 | −1.0% |
+| Equal-weight **33 hand-picked names** | +249.1% | −35.9% | 0.89 | 1.60 | +12.5% |
 | Momentum top-6, **39 hand-picked names** | +726.8% | −39.0% | 1.30 | 0.93 | +45.7% |
 | Momentum top-6, **951 mechanical names** | **+329.2%** | −38.2% | **0.93** | 0.85 | **+28.7%** |
 | top-10, $50M ADV, vol ≤ 60% | +112.9% | **−21.2%** | 0.73 | 0.64 | +9.4% |
 | top-10, $100M ADV, vol ≤ 50% | +48.1% | −33.0% | 0.42 | 0.60 | +1.3% |
+
+The two equal-weight rows are the bias measurement itself: the same rule applied
+to 951 mechanically-chosen names returns **+59.8%**, and to the 39 hand-picked
+names **+249.1%**. That ~190pp gap is pure hindsight, before any strategy runs.
 
 **The edge survives.** On a universe nobody curated, momentum still returns
 +329.2% against SPY's +70.7%, with a better Sharpe (0.93 vs 0.60) and +28.7%
@@ -60,6 +66,12 @@ backtest was booking total losses on takeovers.
 Fix: `HistoricalBook.last_price()` liquidates a delisted holding at its **last
 traded price**. Bankruptcies end near zero anyway, so the same rule handles both.
 After the fix the drawdown fell from −76.6% to −38.2%, which is the honest number.
+
+The same bug was also in the equal-weight **benchmark**, where it mattered in the
+opposite direction: it reported −65.6% drawdown for a 951-name basket while SPY
+fell 25%, understating the control and flattering every strategy measured against
+it. Corrected to +59.8% / −25.3%, which is what an equal-weight basket of 951
+liquid names should look like.
 
 This is exactly the kind of bug that makes a survivorship-bias control produce
 *worse* results than the biased universe and gets dismissed as "the broad universe
