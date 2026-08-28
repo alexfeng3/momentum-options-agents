@@ -178,6 +178,11 @@ class StrategyAgent:
         return {"underlying": sym, "spot": spot, "iv": iv,
                 "iv_rank": n.iv_rank, "short_strike": ks, "long_strike": kl,
                 "width": width, "est_credit": round(credit, 2),
-                "max_loss_per_contract": round((width - credit) * 100, 2),
+                # Max loss must include the slippage paid to CLOSE. Reserving
+                # only (width - credit) under-collateralises every spread by the
+                # exit slippage, and a full-loss exit then leaves the account
+                # short against its other reservations.
+                "max_loss_per_contract": round(
+                    (width * (1 + cfg.slippage) - credit) * 100, 2),
                 "expiry_target": (as_of + timedelta(days=cfg.dte)).isoformat(),
                 "dte": cfg.dte}

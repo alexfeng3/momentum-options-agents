@@ -80,3 +80,20 @@ def test_solvency_assertion_fires_on_manual_corruption():
         "options_agents.portfolio", fromlist=["Reservation"]).Reservation("z", 500.0))
     with pytest.raises(CapitalError, match="used twice"):
         pf.assert_solvent("test")
+
+
+def test_collateral_covers_a_full_loss_including_exit_slippage():
+    """A spread closed at its maximum loss must not leave the account short.
+
+    Reserving only (width - credit) ignores the slippage paid to close, so a
+    full-loss exit drains cash below the collateral still reserved for other
+    positions. The live backtest tripped this on MARA.
+    """
+    width, credit, slip, n = 10.0, 1.0, 0.05, 3
+    collateral = (width * (1 + slip) - credit) * 100 * n
+    pf = Portfolio(cash=collateral)
+    pf.open_short_spread("X", credit_total=credit * 100 * n, collateral=collateral)
+    worst = width * (1 + slip) * 100 * n          # max loss plus exit slippage
+    pf.close_short_spread("X", debit_total=worst)
+    assert pf.cash >= -1e-6, f"cash went negative: {pf.cash}"
+    pf.assert_solvent("full loss")

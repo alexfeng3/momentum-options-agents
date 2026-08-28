@@ -38,8 +38,11 @@ announcement, so the strategy captures the drift and never the jump.
 holds — bullish exposure with *positive* theta instead of paying it. Max loss is
 the spread width, always.
 
-Full evidence, including what failed: **[docs/DIRECTIONAL.md](docs/DIRECTIONAL.md)**
-and **[docs/UNIVERSE.md](docs/UNIVERSE.md)**.
+**[STRATEGY.md](STRATEGY.md) is the one-page summary — start there.**
+Full evidence, every parameter and every failed experiment:
+[docs/STRATEGY_DETAIL.md](docs/STRATEGY_DETAIL.md),
+[docs/DIRECTIONAL.md](docs/DIRECTIONAL.md),
+[docs/UNIVERSE.md](docs/UNIVERSE.md).
 
 ---
 
@@ -156,9 +159,15 @@ python -m options_agents.cli status
 ```
 
 ```bash
+python scripts/run_live_config.py
+```
+Backtest **the deployed configuration** — all three sleeves sharing one pot of
+capital. This is the one that matches what the agents run.
+
+```bash
 python scripts/report.py
 ```
-Full train / validate / test tearsheet: return, win rate, per-trade Sharpe, profit
+Per-sleeve attribution tearsheet: return, win rate, per-trade Sharpe, profit
 factor, drawdown, annualised Sharpe, beta, alpha, and the SPY benchmark.
 
 ```bash
