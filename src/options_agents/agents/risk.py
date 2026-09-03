@@ -54,6 +54,9 @@ class RiskAgent:
 
         # Exits first: they free capital and reduce risk, so they are never blocked
         # by exposure or concentration limits.
+        for p in [x for x in proposals if x.kind == "SPREAD_EXIT"]:
+            out.append(self._spread_exit(p, paper_verified, market_open))
+
         for p in [x for x in proposals if x.kind in ("EXIT", "TRIM")]:
             out.append(self._exit(p, pf, prices, paper_verified, market_open, equity))
 
@@ -76,7 +79,7 @@ class RiskAgent:
                     except Exception:
                         pass
 
-        for p in [x for x in proposals if x.kind not in ("EXIT", "TRIM")]:
+        for p in [x for x in proposals if x.kind not in ("EXIT", "TRIM", "SPREAD_EXIT")]:
             d = self._entry(p, sim, prices, equity, n_open,
                             paper_verified, market_open, llm_review)
             out.append(d)
@@ -108,6 +111,25 @@ class RiskAgent:
         return out
 
     # ------------------------------------------------------------------ exits
+    def _spread_exit(self, p, paper_verified, market_open) -> Decision:
+        """Closing a short spread returns collateral and removes a liability, so
+        it is never subject to exposure, concentration or cash limits. The only
+        hard gates are the ones that protect the account itself."""
+        st = p.structure or {}
+        if not paper_verified:
+            return Decision(p.symbol, p.kind, "REJECT",
+                            "Paper trading is not verified — all orders blocked.")
+        if not market_open:
+            return Decision(p.symbol, p.kind, "REJECT", "Market is closed.")
+        n = int(st.get("contracts") or 0)
+        if n < 1:
+            return Decision(p.symbol, p.kind, "REJECT",
+                            f"No open {p.symbol} spread to close.")
+        return Decision(p.symbol, p.kind, "APPROVE",
+                        f"Close approved — {n} contract(s), risk-reducing and "
+                        f"not subject to exposure caps. {p.reason}",
+                        contracts=n)
+
     def _exit(self, p, pf, prices, paper_verified, market_open,
               equity: float = 0.0) -> Decision:
         chk = []

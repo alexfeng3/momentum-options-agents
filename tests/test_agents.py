@@ -379,3 +379,107 @@ def test_a_quote_too_wide_to_trust_falls_back_to_the_model():
     credit, meta = ex._limit_credit(legs, resolved, st)
     assert meta["source"] == "model_fallback"
     assert "no credit" in meta["why"] and meta["natural_credit"] < 0
+
+
+# -------------------------------------------------------------- spread exits
+# Before 2026-09-03 the live agents could OPEN a spread and never close one:
+# the 50%-profit rule existed only in the backtesters, so every live spread ran
+# to expiry and the system traded a different strategy from the tearsheet's.
+
+def _open_spread(entry_credit=0.45, expiry="2026-09-25", mid=0.17,
+                 two_sided=True, contracts=11):
+    from options_agents.spreads import OpenSpread
+    from datetime import date as _d
+    sp = OpenSpread(underlying="AAA", expiry=_d.fromisoformat(expiry), right="P",
+                    short_symbol="AAA260925P00027000",
+                    long_symbol="AAA260925P00025000",
+                    short_strike=27.0, long_strike=25.0, contracts=contracts,
+                    entry_credit=entry_credit)
+    sp.pricing = {"two_sided": two_sided, "mid_debit": mid,
+                  "natural_debit": mid + 0.08}
+    return sp
+
+
+def _exits(cfg, spreads, as_of=date(2026, 9, 3)):
+    from options_agents.agents.strategy import StrategyAgent
+    return StrategyAgent(cfg, NullLog())._spread_exits(spreads, as_of)
+
+
+def test_spread_is_bought_back_at_the_profit_target():
+    # sold at 0.45, buyable at 0.17 -> 62% of the credit earned, target is 50%
+    out = _exits(LiveConfig(profit_target=0.50), [_open_spread(mid=0.17)])
+    assert len(out) == 1 and out[0].kind == "SPREAD_EXIT"
+    assert "Profit target" in out[0].reason
+    assert out[0].structure["contracts"] == 11
+
+
+def test_spread_is_left_alone_before_the_profit_target():
+    # buyable at 0.30 -> only 33% earned
+    assert _exits(LiveConfig(profit_target=0.50), [_open_spread(mid=0.30)]) == []
+
+
+def test_spread_is_closed_near_expiry_whatever_the_profit():
+    """A short put left open into expiry gets exercised against the account
+    rather than closed on our terms."""
+    out = _exits(LiveConfig(profit_target=0.50, close_dte=5),
+                 [_open_spread(mid=0.44, expiry="2026-09-05")])
+    assert len(out) == 1 and "to expiry" in out[0].reason
+
+
+def test_profit_target_is_not_taken_off_an_untradeable_quote():
+    assert _exits(LiveConfig(), [_open_spread(mid=0.01, two_sided=False)]) == []
+
+
+def test_spread_exit_is_approved_even_with_no_cash_and_at_every_limit():
+    from options_agents.agents.strategy import StrategyAgent
+    p = _exits(LiveConfig(), [_open_spread()])[0]
+    d = RiskAgent(LiveConfig(max_positions=0), NullLog()).run(
+        [p], Portfolio(cash=0.0), PRICES, 100_000,
+        paper_verified=True, market_open=True)[0]
+    assert d.approved and d.contracts == 11
+
+
+def test_spread_exit_still_obeys_the_paper_gate():
+    p = _exits(LiveConfig(), [_open_spread()])[0]
+    d = risk().run([p], Portfolio(cash=0.0), PRICES, 100_000,
+                   paper_verified=False, market_open=True)[0]
+    assert not d.approved and "not verified" in d.reason
+
+
+def test_closing_order_is_buy_to_close_at_a_positive_debit():
+    """Alpaca's mleg convention is net-debit: opening a credit spread sends a
+    negative limit, closing it sends a positive one."""
+    from datetime import datetime
+    p = _exits(LiveConfig(), [_open_spread(mid=0.17)])[0]
+    d = Decision("AAA", "SPREAD_EXIT", "APPROVE", "close", contracts=11)
+    d.structure = p.structure
+    captured = {}
+
+    class Log(NullLog):
+        def emit(self, agent, event, payload):
+            if event == "order_request":
+                captured.update(payload)
+            return {}
+
+    ex = ExecutionAgent(_OptBroker(), LiveConfig(limit_cross=0.5), Log(),
+                        dry_run=True)
+    r = ex._submit_spread_exit(d, "moqa-spread_exit-AAA-1", datetime.now())
+    assert r.status == "dry_run"
+    assert captured["limit_price"] > 0
+    assert [l["position_intent"] for l in captured["legs"]] == \
+        ["buy_to_close", "sell_to_close"]
+    # mid 0.17, natural 0.25, half way = 0.21
+    assert captured["limit_price"] == pytest.approx(0.21, abs=0.01)
+
+
+def test_overlay_does_not_reopen_a_spread_it_is_closing_this_cycle():
+    from options_agents.agents.strategy import StrategyAgent
+    cfg = LiveConfig(universe=("AAA",), top_n=1, core_weight=0.8,
+                     overlay_enabled=True)
+    snap = _snap(["AAA"], {"AAA": 100.0})
+    props = StrategyAgent(cfg, NullLog()).run(
+        snap, {"AAA": 800.0}, _Book(), date(2026, 9, 3),
+        held_value={"AAA": 80_000.0}, equity=100_000.0,
+        open_spreads=[_open_spread(mid=0.17)])
+    assert any(p.kind == "SPREAD_EXIT" for p in props)
+    assert not any(p.kind == "SPREAD" for p in props)

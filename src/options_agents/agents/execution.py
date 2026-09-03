@@ -71,7 +71,8 @@ class ExecutionAgent:
 
         out = []
         # exits first so their capital is available to the entries
-        for d in sorted(approved, key=lambda x: 0 if x.kind == "EXIT" else 1):
+        order = {"SPREAD_EXIT": 0, "EXIT": 0, "TRIM": 0}
+        for d in sorted(approved, key=lambda x: order.get(x.kind, 1)):
             out.append(self._submit(d, snap, open_syms))
         return out
 
@@ -90,6 +91,8 @@ class ExecutionAgent:
 
         if d.kind == "SPREAD":
             return self._submit_spread(d, snap, coid, now)
+        if d.kind == "SPREAD_EXIT":
+            return self._submit_spread_exit(d, coid, now)
         return self._submit_stock(d, coid, now)
 
     # ------------------------------------------------------------------ stock
@@ -204,6 +207,76 @@ class ExecutionAgent:
             return r
         o = self.broker.poll_fill(o["id"], self.cfg.fill_poll_seconds)
         r = OrderResult(d.symbol, d.kind, "sell_to_open", None, contracts,
+                        o["id"], o["client_order_id"], o["status"],
+                        o["submitted_at"], float(o.get("filled_qty") or 0),
+                        None, legs=legs)
+        self.log.emit(self.name, "order_response", r.to_dict())
+        return r
+
+    # ------------------------------------------------------------ spread exit
+    def _submit_spread_exit(self, d, coid, now) -> OrderResult:
+        """Buy the spread back. The legs are already known — they came from the
+        broker's own positions — so there is no contract lookup, only pricing."""
+        st = getattr(d, "structure", None) or {}
+        legs = [
+            {"symbol": st.get("short_symbol"), "ratio_qty": "1", "side": "buy",
+             "position_intent": "buy_to_close"},
+            {"symbol": st.get("long_symbol"), "ratio_qty": "1", "side": "sell",
+             "position_intent": "sell_to_close"},
+        ]
+
+        def fail(msg):
+            r = OrderResult(d.symbol, d.kind, "buy_to_close", None, d.contracts,
+                            None, coid, "error", now.isoformat(), legs=legs,
+                            error=msg)
+            self.log.emit(self.name, "order_error", r.to_dict())
+            return r
+
+        if not all(l["symbol"] for l in legs):
+            return fail("spread exit is missing a leg symbol")
+
+        q = st.get("pricing") or {}
+        mid, natural = q.get("mid_debit"), q.get("natural_debit")
+        if q.get("two_sided") and mid is not None and natural is not None:
+            # Closing PAYS a debit, so conceding means paying MORE. Same knob,
+            # mirrored: limit_cross of the mid->natural distance.
+            debit = mid + self.cfg.limit_cross * (natural - mid)
+            source = "quotes"
+        elif natural and natural > 0:
+            # Not two-sided, but we can still see what crossing costs. Near expiry
+            # getting out matters more than getting the last cent.
+            debit, source = natural, "natural_only"
+        else:
+            return fail("no usable market to price the close against")
+
+        debit = max(0.01, round(debit, 2))
+        req = {"symbol": d.symbol, "contracts": d.contracts, "legs": legs,
+               "limit_price": debit, "client_order_id": coid,
+               "dry_run": self.dry_run, "structure": st, "pricing_source": source}
+        self.log.emit(self.name, "order_request", req)
+
+        if self.dry_run:
+            kept = (st.get("entry_credit", 0) - debit) * 100 * (d.contracts or 0)
+            print(f"  [DRY-RUN] CLOSE {d.symbol:<6} put spread "
+                  f"{st.get('long_strike')}/{st.get('short_strike')} "
+                  f"x{d.contracts} @ net debit {debit:.2f} ({source})  "
+                  f"keeps ${kept:,.0f} of the credit")
+            r = OrderResult(d.symbol, d.kind, "buy_to_close", None, d.contracts,
+                            None, coid, "dry_run", now.isoformat(), legs=legs,
+                            dry_run=True)
+            self.log.emit(self.name, "order_response", r.to_dict())
+            return r
+
+        if not self.broker.verified:
+            raise NotPaperTradingError("paper mode not verified at submit time")
+        try:
+            o = self.broker.submit_spread_order(legs=legs, qty=d.contracts,
+                                                limit_price=debit,
+                                                client_order_id=coid)
+        except Exception as e:
+            return fail(str(e))
+        o = self.broker.poll_fill(o["id"], self.cfg.fill_poll_seconds)
+        r = OrderResult(d.symbol, d.kind, "buy_to_close", None, d.contracts,
                         o["id"], o["client_order_id"], o["status"],
                         o["submitted_at"], float(o.get("filled_qty") or 0),
                         None, legs=legs)

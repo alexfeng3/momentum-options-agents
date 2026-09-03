@@ -236,6 +236,7 @@ src/options_agents/
   volatility.py       vol surface: term structure + skew
   selection.py        point-in-time momentum scoring
   earnings.py         SEC XBRL events, SUE, announcement detection
+  spreads.py          pairs broker option legs back into spreads; exit pricing
   llm.py              Judgment Agent; abstains without a key
   agents/             the five agents, one file each
   orchestrator.py     wires one cycle

@@ -201,6 +201,35 @@ blown-out long leg passes any per-leg width check while still being untradeable 
 UTHR quoted a 6.98 mid whose natural was −0.15. If crossing does not yield a
 credit, there is no market worth anchoring to.
 
+### 3.4.2 Options overlay exit
+
+| # | Rule | Default | Config key |
+|---|---|---|---|
+| X1 | Profit target | buy the spread back once **50%** of the credit is earned | `profit_target` |
+| X2 | Expiry | always close at **≤5 DTE**, whatever the P&L | `close_dte` |
+| X3 | Pricing | mid + `limit_cross` × (natural − mid); closing pays a debit, so conceding means paying **more** | `limit_cross` |
+| X4 | Priority | spread exits are submitted **before** any entry, so their collateral is free for the same cycle | — |
+
+Until 2026-09-03 none of this existed in the live path — `profit_target` lived
+only in `backtest_pead.py` and `backtest_directional.py`. The agents could open a
+spread and had no way to close one: proposal kinds were `CORE/PEAD/SPREAD/EXIT/
+TRIM`, and `EXIT` reads `pf.shares`, which the orchestrator builds with option
+positions filtered out. Every live spread would have run to expiry — a different
+strategy from the one on the tearsheet, and one that hands ITM shorts to
+assignment instead of closing them.
+
+Alpaca reports each leg separately, so `spreads.py` pairs them back into the
+spread that was sold. The entry credit is recovered from the legs themselves
+(`short.avg_entry_price − long.avg_entry_price`), so no state file has to survive
+between runs and nothing drifts out of sync with the broker. Two guards: an
+unpaired short leg is ignored rather than guessed at, and a "credit" wider than
+the spread is refused, because that means `avg_entry_price` is not in the units
+assumed and acting on it would misprice the exit.
+
+The profit test uses the **mid**, not the natural. Measuring profit off the price
+you would be forced to pay makes a winner look like a loser whenever the market
+is wide.
+
 ### 3.5 Position sizing
 
 | Sleeve | Size | Config key |
@@ -501,6 +530,8 @@ actions beyond split adjustment.
 | Per-spread risk | 3% of equity | `risk_per_spread` |
 | Max spread width | $25 | `max_width_dollars` |
 | Limit concession | 50% of the mid→natural distance | `limit_cross` |
+| Spread profit target | buy back at 50% of the credit | `profit_target` |
+| Spread expiry close | ≤5 DTE, unconditional | `close_dte` |
 
 ### 9.2 Portfolio limits
 | Limit | Value | Config key |
@@ -542,6 +573,12 @@ all refused.
   (scores bit-identical with future bars deleted), no PEAD event dated before it
   was public, 0 overspends in 300 randomised approval sequences, all six
   paper-guard attack vectors refused, beta exact on synthetics.
+- **2026-09-03** — Spread **exits** implemented (§3.4.2). The live agents could
+  open a spread and never close one: `profit_target` existed only in the
+  backtesters, and `EXIT` cannot see an option position. Every live spread would
+  have run to expiry, which is neither the backtested strategy nor a safe one.
+  Adds `spreads.py` (pure leg-pairing, entry credit recovered from the legs), a
+  `SPREAD_EXIT` proposal kind, and closing orders submitted ahead of entries.
 - **2026-09-03** — The overlay had never actually filled. Four defects, each
   independently fatal: (1) spreads were proposed only for names being *bought*
   this cycle, so a book already at target weight produced none and an unfilled

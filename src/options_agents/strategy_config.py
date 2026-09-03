@@ -69,6 +69,12 @@ class LiveConfig:
     # and fills at once. Was `limit_giveup`, a fraction of a Black-Scholes credit
     # that had no relation to any real bid/ask.
     limit_cross: float = 0.50
+    # Spread lifecycle. Without these the agents could OPEN a spread and never
+    # close one: the 50%-profit rule lived only in the backtesters, so the live
+    # system held every spread to expiry and ran a different strategy from the
+    # one on the tearsheet.
+    profit_target: float = 0.50      # buy it back once half the credit is earned
+    close_dte: int = 5               # and always close this close to expiry
 
     # --- capital ---------------------------------------------------------
     cash_floor: float = 0.02         # always keep this fraction unspent
@@ -94,6 +100,8 @@ class LiveConfig:
             dte=_i("DTE", 30),
             iv_rank_min=_f("IV_RANK_MIN", 20.0),
             limit_cross=_f("LIMIT_CROSS", 0.50),
+            profit_target=_f("PROFIT_TARGET", 0.50),
+            close_dte=_i("CLOSE_DTE", 5),
             risk_per_spread=_f("RISK_PER_SPREAD", 0.03),
             max_overlay_risk=_f("MAX_OVERLAY_RISK", 0.15),
             min_price=_f("MIN_PRICE", 10.0),

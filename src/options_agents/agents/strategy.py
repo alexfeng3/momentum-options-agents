@@ -4,6 +4,7 @@ Turns the market snapshot into concrete proposals:
   * CORE   — equal-weight stock positions in the top-N momentum names.
   * PEAD   — a stock position when a real SEC earnings event shows a positive SUE
              AND a volume-confirmed positive gap.
+  * SPREAD_EXIT — buy back an open spread at the profit target or near expiry.
   * SPREAD — a defined-risk short put spread on a name already selected, but only
              where the backtest says it pays: when free cash would otherwise sit
              idle (see docs/DIRECTIONAL.md — the overlay is a drag on a fully
@@ -21,7 +22,7 @@ from typing import Literal
 from ..pricing import price, strike_for_delta
 from ..selection import realised_vol
 
-Kind = Literal["CORE", "PEAD", "SPREAD", "EXIT", "TRIM"]
+Kind = Literal["CORE", "PEAD", "SPREAD", "SPREAD_EXIT", "EXIT", "TRIM"]
 
 
 @dataclass
@@ -47,7 +48,8 @@ class StrategyAgent:
     def run(self, snap, held: dict[str, float], book, as_of: date,
             held_value: dict[str, float] | None = None,
             equity: float | None = None,
-            held_options: set[str] | None = None) -> list[Proposal]:
+            held_options: set[str] | None = None,
+            open_spreads: list | None = None) -> list[Proposal]:
         """`held_value` is the CURRENT dollar value of each holding and `equity`
         the account total. Without them the agent cannot tell a fresh entry from
         a position already at target weight, and re-buys the whole book every
@@ -55,11 +57,19 @@ class StrategyAgent:
 
         `held_options` is the set of underlyings that already carry an option
         position, so the overlay does not stack a second spread on a name.
+        `open_spreads` are those positions paired back into spreads, each already
+        carrying its legs' quotes, so the exit rules can be applied to them.
         """
         cfg = self.cfg
         out: list[Proposal] = []
         held_value = held_value or {}
         held_options = held_options or set()
+        open_spreads = open_spreads or []
+
+        # ---- close open spreads ---------------------------------------------
+        # Runs BEFORE the regime gate: an open short spread is a live liability
+        # and taking it off is risk-reducing in every regime.
+        out.extend(self._spread_exits(open_spreads, as_of))
 
         # ---- regime gate: SPY below its 200-day SMA means no new risk --------
         if cfg.market_filter and not snap.spy_above_sma200:
@@ -146,8 +156,9 @@ class StrategyAgent:
             pead_syms = [x.symbol for x in out if x.kind == "PEAD"]
             exiting = {x.symbol for x in out if x.kind == "EXIT"}
             seen: set[str] = set()
+            closing = {x.symbol for x in out if x.kind == "SPREAD_EXIT"}
             for sym in [s for s in picks + pead_syms if s not in exiting]:
-                if sym in seen or sym in held_options:
+                if sym in seen or sym in held_options or sym in closing:
                     continue          # one live spread per name at a time
                 seen.add(sym)
                 st = self._spread(sym, snap, book, as_of)
@@ -164,8 +175,49 @@ class StrategyAgent:
             "core": sum(1 for p in out if p.kind == "CORE"),
             "pead": sum(1 for p in out if p.kind == "PEAD"),
             "spreads": sum(1 for p in out if p.kind == "SPREAD"),
+            "spread_exits": sum(1 for p in out if p.kind == "SPREAD_EXIT"),
             "exits": sum(1 for p in out if p.kind == "EXIT"),
             "all": [p.to_dict() for p in out]})
+        return out
+
+    def _spread_exits(self, open_spreads, as_of: date) -> list[Proposal]:
+        """Close a spread at the profit target, or when expiry gets close.
+
+        Both rules matter. The profit target is where the overlay's modelled edge
+        comes from — holding a 20-delta spread to expiry for the last few cents
+        of premium risks the whole width to earn almost nothing. The DTE rule is
+        assignment control: a short put left open into expiry gets exercised
+        against the account rather than closed on our terms.
+        """
+        cfg = self.cfg
+        out: list[Proposal] = []
+        for sp in open_spreads:
+            dte = sp.dte(as_of)
+            q = getattr(sp, "pricing", None) or {}
+            mid = q.get("mid_debit")
+            target_debit = sp.entry_credit * (1 - cfg.profit_target)
+            sig = {"entry_credit": sp.entry_credit, "dte": dte,
+                   "mid_debit": mid, "target_debit": round(target_debit, 4),
+                   "width": sp.width, "contracts": sp.contracts}
+
+            reason = None
+            if dte <= cfg.close_dte:
+                reason = (f"{dte}d to expiry (≤{cfg.close_dte}) — closing before "
+                          f"assignment risk, not on our terms.")
+            elif q.get("two_sided") and mid is not None and mid <= target_debit:
+                earned = (sp.entry_credit - mid) / sp.entry_credit
+                reason = (f"Profit target: sold at {sp.entry_credit:.2f}, can buy "
+                          f"back at {mid:.2f} — {earned:.0%} of the credit earned "
+                          f"(target {cfg.profit_target:.0%}), {dte}d left.")
+            if not reason:
+                continue
+            out.append(Proposal(
+                sp.underlying, "SPREAD_EXIT", "BUY_TO_CLOSE", None, reason, sig,
+                {"underlying": sp.underlying, "short_symbol": sp.short_symbol,
+                 "long_symbol": sp.long_symbol, "short_strike": sp.short_strike,
+                 "long_strike": sp.long_strike, "width": sp.width,
+                 "contracts": sp.contracts, "entry_credit": sp.entry_credit,
+                 "expiry": sp.expiry.isoformat(), "dte": dte, "pricing": q}))
         return out
 
     def _spread(self, sym, snap, book, as_of) -> dict | None:

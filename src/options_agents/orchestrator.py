@@ -15,6 +15,7 @@ from .broker import AlpacaBroker
 from .eventlog import ET, EventLog
 from .marketdata import HistoricalBook
 from .portfolio import Portfolio
+from .spreads import debit_to_close, pair_spreads
 from .strategy_config import LiveConfig
 
 
@@ -62,12 +63,31 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
     equity = float(acct["equity"])
     pf = Portfolio(cash=float(acct["cash"]), shares=dict(held))
 
+    # Pair the broker's individual option legs back into the spreads the strategy
+    # sold, and price each one, so the exit rules have something to act on.
+    open_spreads = pair_spreads(positions)
+    if open_spreads:
+        leg_syms = [x for sp in open_spreads
+                    for x in (sp.short_symbol, sp.long_symbol)]
+        try:
+            quotes = broker.get_option_quotes(leg_syms)
+        except Exception as e:
+            quotes = {}
+            log.emit("orchestrator", "spread_quotes_failed", {"error": str(e)})
+        for sp in open_spreads:
+            sp.quotes = quotes
+            sp.pricing = debit_to_close(sp)
+        log.emit("orchestrator", "open_spreads",
+                 {"count": len(open_spreads),
+                  "spreads": [sp.to_dict() for sp in open_spreads]})
+
     # 2. Strategy Agent
     held_value = {p["symbol"]: float(p["market_value"]) for p in positions
                   if p.get("asset_class") != "us_option"}
     proposals = StrategyAgent(cfg, log).run(snap, held, book, as_of,
                                             held_value=held_value, equity=equity,
-                                            held_options=held_options)
+                                            held_options=held_options,
+                                            open_spreads=open_spreads)
 
     # 3. Judgment Agent (LLM) — veto only, abstains without a key
     review = None
