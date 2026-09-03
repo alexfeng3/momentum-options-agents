@@ -46,14 +46,20 @@ class StrategyAgent:
 
     def run(self, snap, held: dict[str, float], book, as_of: date,
             held_value: dict[str, float] | None = None,
-            equity: float | None = None) -> list[Proposal]:
+            equity: float | None = None,
+            held_options: set[str] | None = None) -> list[Proposal]:
         """`held_value` is the CURRENT dollar value of each holding and `equity`
         the account total. Without them the agent cannot tell a fresh entry from
         a position already at target weight, and re-buys the whole book every
-        cycle."""
+        cycle.
+
+        `held_options` is the set of underlyings that already carry an option
+        position, so the overlay does not stack a second spread on a name.
+        """
         cfg = self.cfg
         out: list[Proposal] = []
         held_value = held_value or {}
+        held_options = held_options or set()
 
         # ---- regime gate: SPY below its 200-day SMA means no new risk --------
         if cfg.market_filter and not snap.spy_above_sma200:
@@ -131,12 +137,23 @@ class StrategyAgent:
                  "vol_ratio": e["vol_ratio"], "days_since": e["days_since"]}))
 
         # ---- defined-risk short put spreads ---------------------------------
+        # Candidates are the names the model WANTS TO BE LONG, not the names it
+        # happens to be buying this cycle. Keying the overlay off new CORE/PEAD
+        # proposals gave it exactly one attempt — the cycle that builds the book —
+        # because a position already at target weight emits no CORE proposal at
+        # all. Three spreads went unfilled on 2026-08-28 and were never retried.
         if cfg.overlay_enabled:
-            for p in [x for x in out if x.kind in ("CORE", "PEAD")]:
-                st = self._spread(p.symbol, snap, book, as_of)
+            pead_syms = [x.symbol for x in out if x.kind == "PEAD"]
+            exiting = {x.symbol for x in out if x.kind == "EXIT"}
+            seen: set[str] = set()
+            for sym in [s for s in picks + pead_syms if s not in exiting]:
+                if sym in seen or sym in held_options:
+                    continue          # one live spread per name at a time
+                seen.add(sym)
+                st = self._spread(sym, snap, book, as_of)
                 if st:
                     out.append(Proposal(
-                        p.symbol, "SPREAD", "SELL_TO_OPEN", None,
+                        sym, "SPREAD", "SELL_TO_OPEN", None,
                         f"Short {cfg.short_delta:.0%}-delta put spread on a name the "
                         f"model is already long — bullish exposure with positive "
                         f"theta instead of paying it.",

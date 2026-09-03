@@ -211,13 +211,19 @@ Read these before believing any number in this repo.
    option chain is available, so Black-Scholes on a volatility surface built from
    VIX/VXN (index) or realised vol × 1.10 (single names). Frictions are charged
    both ways, but this is an edge estimate, not an achievable P&L.
-4. **The strategy is high-beta and high-drawdown.** −38% on the broad universe. It
+4. **The overlay has not filled in paper yet.** Three spreads were submitted on
+   2026-08-28 and all three expired unfilled; the causes were execution defects,
+   fixed on 2026-09-03 and pinned by regression tests
+   (`docs/STRATEGY_DETAIL.md` §3.4.1). Until spreads actually fill, every overlay
+   number in this repo is a model output and the live system is a momentum book
+   with a PEAD sleeve.
+5. **The strategy is high-beta and high-drawdown.** −38% on the broad universe. It
    maximises return, not survivability.
-5. **It underperforms in low-volatility melt-ups**, when the market runs away from
+6. **It underperforms in low-volatility melt-ups**, when the market runs away from
    a concentrated book and short premium is not paid.
-6. **Screening to large, calm names collapses the alpha to ~+1%/yr.** The edge
+7. **Screening to large, calm names collapses the alpha to ~+1%/yr.** The edge
    lives in volatility. This is not a quality strategy in disguise.
-7. **Alpaca's IEX daily history starts ~2020-07**, so the broad-universe test
+8. **Alpaca's IEX daily history starts ~2020-07**, so the broad-universe test
    covers one regime (~6 years), and IEX quotes are not the NBBO.
 
 ## Layout

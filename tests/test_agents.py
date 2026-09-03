@@ -210,3 +210,172 @@ def test_exit_still_sells_everything():
                    {"AAA": 100.0}, 100_000, paper_verified=True,
                    market_open=True)[0]
     assert d.approved and d.qty == 900.0
+
+
+# ------------------------------------------------------------------- overlay
+# The 2026-08-28 failure: three put spreads were submitted, none filled, and the
+# overlay never tried again. Two independent defects caused it, one per test.
+
+def test_overlay_proposes_on_a_held_name_with_no_new_core_buy():
+    """THE regression. The overlay used to key off new CORE/PEAD proposals, but a
+    position already at target weight emits none — so it got exactly one attempt,
+    on the cycle that built the book, and could never retry an unfilled spread."""
+    from options_agents.agents.strategy import StrategyAgent
+    cfg = LiveConfig(universe=("AAA",), top_n=1, core_weight=0.8,
+                     overlay_enabled=True, iv_rank_min=20.0)
+    snap = _snap(["AAA"], {"AAA": 100.0})
+    props = StrategyAgent(cfg, NullLog()).run(
+        snap, {"AAA": 800.0}, _Book(), date(2026, 8, 28),
+        held_value={"AAA": 80_000.0}, equity=100_000.0)
+    assert [p for p in props if p.kind == "CORE"] == [], "already at target"
+    assert [p for p in props if p.kind == "SPREAD"], \
+        "overlay must still propose on a name the model is long"
+
+
+def test_overlay_does_not_stack_a_second_spread_on_the_same_name():
+    from options_agents.agents.strategy import StrategyAgent
+    cfg = LiveConfig(universe=("AAA",), top_n=1, core_weight=0.8,
+                     overlay_enabled=True)
+    snap = _snap(["AAA"], {"AAA": 100.0})
+    props = StrategyAgent(cfg, NullLog()).run(
+        snap, {"AAA": 800.0}, _Book(), date(2026, 8, 28),
+        held_value={"AAA": 80_000.0}, equity=100_000.0,
+        held_options={"AAA"})
+    assert [p for p in props if p.kind == "SPREAD"] == []
+
+
+def test_overlay_does_not_write_a_spread_on_a_name_being_exited():
+    from options_agents.agents.strategy import StrategyAgent
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1, core_weight=0.8,
+                     overlay_enabled=True)
+    snap = _snap(["AAA"], {"AAA": 100.0})
+    props = StrategyAgent(cfg, NullLog()).run(
+        snap, {"BBB": 100.0}, _Book(), date(2026, 8, 28),
+        held_value={"BBB": 10_000.0}, equity=100_000.0)
+    assert any(p.kind == "EXIT" and p.symbol == "BBB" for p in props)
+    assert not any(p.kind == "SPREAD" and p.symbol == "BBB" for p in props)
+
+
+class _OptBroker:
+    """Chain that lists 95/85 strikes when the model asked for 96.20/84.09."""
+    verified = True
+
+    def __init__(self, quotes=None, strikes=(95.0, 85.0)):
+        self.quotes, self.strikes = quotes or {}, strikes
+
+    def get_open_orders(self):
+        return []
+
+    def get_option_contracts(self, underlying, **kw):
+        return [{"symbol": f"AAA261016P{int(k*1000):08d}",
+                 "strike_price": str(k), "expiration_date": "2026-10-16"}
+                for k in self.strikes]
+
+    def get_option_quotes(self, symbols):
+        return {s: self.quotes[s] for s in symbols if s in self.quotes}
+
+
+def _spread_decision(contracts=1, collateral=900.0, width=12.11):
+    st = {"underlying": "AAA", "short_strike": 96.20, "long_strike": 84.09,
+          "width": width, "est_credit": 2.50, "max_loss_per_contract": 900.0,
+          "expiry_target": "2026-10-16", "dte": 30, "spot": 100.0, "iv": 0.3,
+          "iv_rank": 50}
+    d = Decision("AAA", "SPREAD", "APPROVE", "overlay", contracts=contracts,
+                 collateral=collateral)
+    d.structure = st
+    return d
+
+
+def test_spread_limit_is_priced_from_the_real_quotes_not_black_scholes():
+    """The model priced a 12.11-wide spread; the chain only lists a 10-wide one.
+    Asking the wider spread's credit is why all three orders expired unfilled."""
+    q = {"AAA261016P00095000": {"bp": 3.00, "ap": 3.40},
+         "AAA261016P00085000": {"bp": 1.00, "ap": 1.20}}
+    ex = ExecutionAgent(_OptBroker(q), LiveConfig(limit_cross=0.5), NullLog(),
+                        dry_run=True)
+    legs, resolved = ex._resolve_contracts(_spread_decision().structure)
+    credit, meta = ex._limit_credit(legs, resolved, _spread_decision().structure)
+    assert resolved["width"] == 10.0            # not the modelled 12.11
+    assert meta["source"] == "quotes"
+    # mid credit 3.20 - 1.10 = 2.10; natural 3.00 - 1.20 = 1.80; halfway = 1.95
+    assert credit == pytest.approx(1.95, abs=0.01)
+    assert credit < abs(_spread_decision().structure["est_credit"])
+
+
+def test_spread_limit_falls_back_to_a_width_scaled_model_credit():
+    """No two-sided market. The fallback must still correct for the fact that the
+    resolved spread is narrower than the one Black-Scholes priced."""
+    ex = ExecutionAgent(_OptBroker({}), LiveConfig(limit_cross=0.5), NullLog(),
+                        dry_run=True)
+    st = _spread_decision().structure
+    legs, resolved = ex._resolve_contracts(st)
+    credit, meta = ex._limit_credit(legs, resolved, st)
+    assert meta["source"] == "model_fallback"
+    # 2.50 scaled by 10.00/12.11 — est_credit already carries cfg.slippage
+    assert credit == pytest.approx(2.50 * 10.0 / 12.11, abs=0.01)
+
+
+def test_spread_is_resized_when_the_listed_strikes_risk_more_than_reserved():
+    """Risk reserved collateral against the MODEL's width. A wider listed spread
+    must be cut to fit the reservation, never silently exceed it."""
+    q = {"AAA261016P00095000": {"bp": 3.00, "ap": 3.40},
+         "AAA261016P00075000": {"bp": 1.00, "ap": 1.20}}
+    ex = ExecutionAgent(_OptBroker(q, strikes=(95.0, 75.0)),
+                        LiveConfig(limit_cross=0.5), NullLog(), dry_run=True)
+    d = _spread_decision(contracts=2, collateral=1_800.0)
+    from datetime import datetime
+    r = ex._submit_spread(d, None, "moqa-spread-AAA-1", datetime.now())
+    # a 20-wide spread risks ~$1,900/contract against $900 reserved per contract
+    assert r.status == "error" and "will not fit" in r.error
+
+
+def test_duplicate_check_sees_a_multi_leg_order_with_a_null_symbol():
+    """Alpaca returns `symbol: null` on an mleg parent, so the old check let a
+    second spread stack on a name that already had one working."""
+    class B(_OptBroker):
+        def get_open_orders(self):
+            return [{"symbol": None, "client_order_id": "moqa-spread-AAA-123"}]
+    ex = ExecutionAgent(B(), CFG, NullLog(), dry_run=True)
+    out = ex.run([_spread_decision()], None)
+    assert out[0].status == "skipped_duplicate"
+
+
+def test_expiry_window_finds_a_monthly_when_the_name_has_no_weeklies():
+    """A +/-10 day window straddles the gap between monthlies, so a name without
+    weeklies resolved nothing whenever the target landed mid-month."""
+    class Monthlies(_OptBroker):
+        seen = {}
+
+        def get_option_contracts(self, underlying, **kw):
+            Monthlies.seen = kw
+            out = []
+            for exp in ("2026-09-18", "2026-10-16"):   # monthlies only
+                if not (kw["expiration_gte"] <= exp <= kw["expiration_lte"]):
+                    continue
+                out += [{"symbol": f"AAA{exp[2:4]}{exp[5:7]}{exp[8:10]}P{int(k*1000):08d}",
+                         "strike_price": str(k), "expiration_date": exp}
+                        for k in (95.0, 85.0)]
+            return out
+
+    ex = ExecutionAgent(Monthlies(), CFG, NullLog(), dry_run=True)
+    st = _spread_decision().structure          # targets 2026-10-16
+    legs, resolved = ex._resolve_contracts(st)
+    assert resolved["expiry"] == "2026-10-16"
+
+    st = dict(st, expiry_target="2026-10-03")  # mid-month: the old window failed
+    legs, resolved = ex._resolve_contracts(st)
+    assert resolved["expiry"] in ("2026-09-18", "2026-10-16")
+
+
+def test_a_quote_too_wide_to_trust_falls_back_to_the_model():
+    """Closing quotes are junk — WBD's 27 put showed 0.06 x 2.37. Pricing off the
+    mid of that invents a credit nobody will pay."""
+    q = {"AAA261016P00095000": {"bp": 0.06, "ap": 2.37},
+         "AAA261016P00085000": {"bp": 0.03, "ap": 0.13}}
+    ex = ExecutionAgent(_OptBroker(q), LiveConfig(limit_cross=0.5), NullLog(),
+                        dry_run=True)
+    st = _spread_decision().structure
+    legs, resolved = ex._resolve_contracts(st)
+    credit, meta = ex._limit_credit(legs, resolved, st)
+    assert meta["source"] == "model_fallback"
+    assert "no credit" in meta["why"] and meta["natural_credit"] < 0

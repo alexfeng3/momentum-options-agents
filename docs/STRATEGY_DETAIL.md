@@ -10,7 +10,7 @@
 
 # Momentum + PEAD + Defined-Risk Options Strategy
 
-**Last updated: 2026-08-28 | Status: PAPER ONLY (Alpaca paper, agent pipeline live) | Config: `momentum-top6 + core_weight 0.80 + PEAD/SUE sleeve + 20Δ put-spread overlay @ 15% max collateral`**
+**Last updated: 2026-09-03 | Status: PAPER ONLY (Alpaca paper, agent pipeline live) | Config: `momentum-top6 + core_weight 0.80 + PEAD/SUE sleeve + 20Δ put-spread overlay @ 15% max collateral`**
 
 This document is the authoritative reference for the strategy as backtested and as
 running in the agent pipeline. `AGENTS.md` covers operational setup; this document
@@ -154,16 +154,52 @@ captured, only the drift — which is what PEAD actually is.
 
 | # | Gate | Default | Config key |
 |---|---|---|---|
-| O1 | Underlying already held | must be a CORE or PEAD name | — |
-| O2 | IV rank | ≥20 (top 80% of its own trailing year) | `iv_rank_min` |
-| O3 | Short strike | 20-delta put | `short_delta` |
-| O4 | Width | 10% of spot, **capped at $25** | `width_pct`, `max_width_dollars` |
-| O5 | Tenor | 30 DTE | `dte` |
-| O6 | Minimum credit | > $0.05 | — |
+| O1 | Underlying is a name the model wants to be **long** | in the top-N or a PEAD entry, held or being bought | — |
+| O2 | No spread already open on that name | one live spread per underlying | — |
+| O3 | IV rank | ≥20 (top 80% of its own trailing year) | `iv_rank_min` |
+| O4 | Short strike | 20-delta put | `short_delta` |
+| O5 | Width | 10% of spot, **capped at $25** | `width_pct`, `max_width_dollars` |
+| O6 | Tenor | 30 DTE | `dte` |
+| O7 | Minimum credit | > $0.05 modelled, > $0.01 at the limit | — |
 
 The `$25` width cap exists because a $528 stock at 10% gives a $5,280 per-contract
 max loss — larger than the whole per-spread risk budget — so the risk agent
 rejected it every cycle and the overlay silently never traded those names.
+
+O1 reads "wants to be long", not "is being bought this cycle". Keying the overlay
+off new CORE/PEAD proposals gave it exactly **one attempt per rebalance** — the
+cycle that builds the book — because a position already inside the rebalance band
+emits no CORE proposal at all. See §3.4.1.
+
+### 3.4.1 How the limit price is set
+
+The strategy agent's `est_credit` is Black-Scholes at the **model's** strikes and
+at exactly `dte` days. The execution agent then has to snap that onto real listed
+OCC contracts, which have neither the same strikes nor the same expiry. Pricing
+the order off the model is therefore pricing a different spread:
+
+| 2026-08-28 | modelled width | listed width | credit asked | outcome |
+|---|---|---|---|---|
+| WBD | 2.89 | 2.00 (27/25) | 0.18 | expired unfilled |
+| JAZZ | 25.00 | 20.00 (230/210) | 2.12 | expired unfilled |
+| TD | 12.11 | 10.00 (115/105) | 0.71 | expired unfilled |
+
+Every listed spread was **narrower** than the one priced, so every order asked
+for more credit than the structure could pay. The limit is now quoted from the
+resolved contracts:
+
+| Step | Rule |
+|---|---|
+| Expiry search | target ±14/+32 days — a ±10 day window straddles the gap between monthlies, so a name without weeklies resolved nothing whenever the target landed mid-month |
+| Market usable? | both legs two-sided **and** the natural (`short_bid − long_ask`) is a **credit** |
+| Limit, with a market | `mid − limit_cross × (mid − natural)` — 0.0 asks the mid and rarely fills, 1.0 crosses and fills at once | `limit_cross` |
+| Limit, without one | model credit scaled by `listed_width / modelled_width`, never above the model |
+| Collateral guard | max loss recomputed on the **listed** strikes; size is cut to fit the reservation the risk agent actually made, never allowed to exceed it |
+
+The natural-credit test does the real work. A tight short leg against a
+blown-out long leg passes any per-leg width check while still being untradeable —
+UTHR quoted a 6.98 mid whose natural was −0.15. If crossing does not yield a
+credit, there is no market worth anchoring to.
 
 ### 3.5 Position sizing
 
@@ -464,6 +500,7 @@ actions beyond split adjustment.
 | Minimum ticket | $100 | `min_ticket` |
 | Per-spread risk | 3% of equity | `risk_per_spread` |
 | Max spread width | $25 | `max_width_dollars` |
+| Limit concession | 50% of the mid→natural distance | `limit_cross` |
 
 ### 9.2 Portfolio limits
 | Limit | Value | Config key |
@@ -505,6 +542,15 @@ all refused.
   (scores bit-identical with future bars deleted), no PEAD event dated before it
   was public, 0 overspends in 300 randomised approval sequences, all six
   paper-guard attack vectors refused, beta exact on synthetics.
+- **2026-09-03** — The overlay had never actually filled. Four defects, each
+  independently fatal: (1) spreads were proposed only for names being *bought*
+  this cycle, so a book already at target weight produced none and an unfilled
+  spread was never retried; (2) the limit was priced off the model's strikes, not
+  the listed ones, and every listed spread was narrower — so every order asked
+  above what it could pay; (3) a ±10-day expiry window resolved nothing for names
+  without weeklies; (4) the duplicate-order check keyed on `symbol`, which is
+  null on a multi-leg parent. Fixed in §3.4/§3.4.1, pinned by seven regression
+  tests. No backtest number changes — this is execution, not signal.
 - **2026-08-28** — Broad-universe validation (§6.4). Momentum alpha survives on 951
   mechanically-screened names (+28.7%/yr) but ~40% of the hand-picked alpha was
   selection bias. Fixed delisting-to-zero in the committed scripts and the

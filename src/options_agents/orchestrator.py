@@ -49,6 +49,11 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
     positions = broker.get_positions()
     held = {p["symbol"]: float(p["qty"]) for p in positions
             if p.get("asset_class") != "us_option"}
+    # An OCC symbol is <root><YYMMDD><C|P><8-digit strike> — the trailing 15
+    # characters are fixed width, so the underlying is everything before them.
+    held_options = {p["symbol"][:-15] for p in positions
+                    if p.get("asset_class") == "us_option"
+                    and len(p.get("symbol", "")) > 15}
     prices = {s: n.last_price for s, n in snap.names.items() if n.last_price}
     for p in positions:
         if p.get("current_price"):
@@ -61,7 +66,8 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
     held_value = {p["symbol"]: float(p["market_value"]) for p in positions
                   if p.get("asset_class") != "us_option"}
     proposals = StrategyAgent(cfg, log).run(snap, held, book, as_of,
-                                            held_value=held_value, equity=equity)
+                                            held_value=held_value, equity=equity,
+                                            held_options=held_options)
 
     # 3. Judgment Agent (LLM) — veto only, abstains without a key
     review = None

@@ -64,7 +64,11 @@ class LiveConfig:
     max_overlay_risk: float = 0.15
     iv_premium: float = 1.10
     slippage: float = 0.05
-    limit_giveup: float = 0.10       # cross this fraction of the credit to fill
+    # How far to concede from the spread's mid toward its natural (immediately
+    # marketable) price. 0.0 asks the mid and rarely fills; 1.0 crosses both legs
+    # and fills at once. Was `limit_giveup`, a fraction of a Black-Scholes credit
+    # that had no relation to any real bid/ask.
+    limit_cross: float = 0.50
 
     # --- capital ---------------------------------------------------------
     cash_floor: float = 0.02         # always keep this fraction unspent
@@ -89,6 +93,7 @@ class LiveConfig:
             width_pct=_f("WIDTH_PCT", 0.10),
             dte=_i("DTE", 30),
             iv_rank_min=_f("IV_RANK_MIN", 20.0),
+            limit_cross=_f("LIMIT_CROSS", 0.50),
             risk_per_spread=_f("RISK_PER_SPREAD", 0.03),
             max_overlay_risk=_f("MAX_OVERLAY_RISK", 0.15),
             min_price=_f("MIN_PRICE", 10.0),

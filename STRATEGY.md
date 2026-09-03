@@ -70,6 +70,10 @@ Expect ~+29%/yr alpha, not the hand-picked number.
 - **Not validated on real option prices.** No historical option chain exists on
   this machine, so spread P&L is modelled with Black-Scholes. Treat it as an
   estimate.
+- **Not yet filled in paper.** The three spreads submitted on 2026-08-28 all
+  expired unfilled. The execution defects behind that were fixed on 2026-09-03
+  (`docs/STRATEGY_DETAIL.md` §3.4.1), but until a spread actually fills, what is
+  running live is the momentum core plus the PEAD sleeve.
 
 ## Safety
 
