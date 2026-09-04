@@ -17,8 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT = Path("/Users/alexfeng/project-workspace/alpaca-hedge-fund")
-PYTHON = Path("/Users/alexfeng/project-workspace/.venv/bin/python")
+PROJECT = Path("~/project-workspace/alpaca-hedge-fund").expanduser()
+PYTHON = Path("~/project-workspace/.venv/bin/python").expanduser()
 FAILURE_PREFIX = "🚨 Hedge Fund cycle FAILED"
 TIMEOUT = 600
 DRY_RUN = os.environ.get("HEDGE_FUND_DRY_RUN", "").strip() in ("1", "true", "yes")

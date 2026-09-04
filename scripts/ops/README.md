@@ -35,7 +35,7 @@ is not — the gateway holds jobs in memory and will overwrite it.
 ## Testing without trading
 
 ```bash
-HEDGE_FUND_DRY_RUN=1 /Users/alexfeng/project-workspace/.venv/bin/python \
+HEDGE_FUND_DRY_RUN=1 ~/project-workspace/.venv/bin/python \
   ~/.hermes/scripts/hedge_fund_cycle_to_discord.py
 ```
 
