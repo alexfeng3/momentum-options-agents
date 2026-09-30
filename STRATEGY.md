@@ -1,79 +1,100 @@
 # Strategy — one page
 
-**Status: paper trading only, live on Alpaca paper.** Detailed evidence, parameter
+**Status: paper trading only, live on Alpaca paper. Momentum core only.** Detailed evidence, parameter
 tables and every failed experiment: [docs/STRATEGY_DETAIL.md](docs/STRATEGY_DETAIL.md).
 
 ---
 
-## What this is
+## What this is (deployed since 2026-09-30)
 
-**A concentrated momentum stock portfolio that sells put spreads against its own
-holdings, plus a small earnings-drift sleeve.**
+**A concentrated momentum stock portfolio, rebalanced monthly. Nothing else.**
 
-One account, three sleeves, one pot of money:
+The system was built as three sleeves. Only the first is running:
 
-| Sleeve | Capital | What it does | Why it's there |
-|---|---|---|---|
-| **Momentum core** | 80% | Buy the 6 strongest-momentum stocks, rebalance monthly, go to cash when SPY < its 200-day average | The return engine — almost all the profit |
-| **PEAD sleeve** | 5% per event | Buy stocks 1 day after a real SEC earnings beat, hold 40 days | Low-beta (β 0.2) diversifier that works when momentum doesn't |
-| **Options overlay** | 15% as collateral | Sell 20-delta put credit spreads on stocks the other two sleeves already own | Collects premium on names we're already bullish on. Max loss = spread width, always |
+| Sleeve | Status | What it does |
+|---|---|---|
+| **Momentum core** | **ON — 80% of equity** | Buy the 6 strongest-momentum stocks, rebalance every 21 days, go to cash when SPY < its 200-day average |
+| PEAD sleeve | OFF (`pead_enabled`) | Would buy after a real SEC earnings beat. Cannot fire: earnings data exists for only 32 names, unrelated to the ranked universe |
+| Options overlay | OFF for new spreads (`overlay_enabled`) | Sold 20-delta put spreads against holdings. 1 of 22 orders filled; not reliably additive on this book (`docs/STRATEGY_DETAIL.md` §6.5) |
 
-The options are **sold, not bought**. We're already long these names; a short put
-spread expresses the same view and *collects* time decay instead of paying it.
-Buying calls on the same names was tested and lost badly.
+An already-open put spread is still closed by the exit rules (50% of the credit
+earned, or 5 days to expiry).
 
 ## What it does, in order
 
-1. Rank every liquid US stock on 12-month momentum (skipping the last month),
-   3-month momentum, trend, and strength vs SPY — all divided by volatility.
-2. If SPY is below its 200-day average → **sell everything, hold cash.** Stop.
-3. Otherwise buy the top 6, equal weight.
-4. Check SEC filings for earnings surprises; buy any that qualify.
-5. On each stock now held, sell a 30-day 20-delta put spread if its implied vol is
-   in the top 80% of its own year.
-6. Exit a stock when it leaves the top 6. Close a spread at 50% profit or expiry.
+1. **Refresh prices.** Append the newly finished sessions to the local cache
+   (`data/broad/`, 951 names + SPY). Never today's partial bar. If a split has
+   changed a symbol's prices, re-fetch its whole history.
+2. **Fail closed.** If the newest SPY bar is more than 5 days old, propose **no
+   stock trades** (no buys, exits or trims) and report `data_stale`. Spread exits
+   still run.
+3. **Is it a rebalance cycle?** Yes if none is recorded, 21+ days have passed since
+   the last, or it is the same day as the last (so a part-filled rebalance can
+   finish). If not, leave the stock book alone. The cron job runs 3x a day; the
+   book changes about once a month. The date lives in `state/rebalance.json`,
+   written only by a live cycle with the market open and fresh data.
+4. **On a rebalance cycle:** rank every liquid US stock on 12-month momentum
+   (skipping the last month), 3-month momentum, trend and strength vs SPY, all
+   divided by volatility. Filters: price ≥ $10, 60-day vol ≤ 60%.
+5. If SPY is below its 200-day average → **sell everything, hold cash.**
+6. Otherwise buy the top 6 (80% / 6 each), sell any holding that left the top 6.
 
-## Results — the configuration above, backtested as one system
+## Results
 
-| Period | Days | Trades | Return | WR | PF | DD | Ann.Sharpe | β | α (ann) | SPY |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Train 2011–18 | 2919 | 463 | +360.1% | 95.2% | 2.12 | −15.3% | 0.95 | 0.83 | +12.0% | +131.3% |
-| Validate 2019–21 | 1094 | 150 | +221.7% | 92.7% | 1.20 | −47.0% | 1.17 | 0.69 | +32.0% | +99.7% |
-| **Test 2022–26** | 1620 | 229 | **+1072.1%** | 94.3% | 2.47 | −30.6% | **1.88** | 0.83 | **+64.5%** | +63.7% |
-| Full 2011–26 | 5638 | 874 | +16302.4% | 93.8% | 2.05 | −47.4% | 1.25 | 0.80 | +28.4% | +661.1% |
+### What is deployed: momentum core, monthly, 951 mechanical names
 
-Test was run once and never tuned on. `python scripts/run_live_config.py`
+`python scripts/run_deployed_config.py` — top 6, 80% invested, price ≥ $10, vol ≤ 60%,
+21-day rebalance, SPY-200 filter; 2021-09-01 → 2026-08-27; 5 bps costs.
 
-### The number that matters most
+| | Return | maxDD | Sharpe | β | α (ann) |
+|---|---|---|---|---|---|
+| SPY | +70.7% | −25.4% | 0.60 | 1.00 | — |
+| Equal-weight the 951 names | +59.8% | −25.3% | 0.50 | 0.98 | −1.0% |
+| **Deployed, first rebalance 2021-09-01** | **+196.5%** | −16.5% | 1.07 | 0.49 | +18.5% |
 
-Those returns are on a **39-name universe hand-picked in 2026** — it contains the
-AI-era winners. On a **951-name universe screened mechanically** (including
-delisted and bankrupt names), over 2021–2026:
+**The start day matters.** Shifting the first rebalance by 0–20 trading days moves
+the total return between **+116% and +214%** (median +154%). One start date is one
+sample; expect a wide range, not +196%.
 
-| | Return | maxDD | Sharpe | α (ann) |
-|---|---|---|---|---|
-| SPY | +70.7% | −25.4% | 0.60 | — |
-| Equal-weight the 951 names | +59.8% | −25.3% | 0.50 | −1.0% |
-| Equal-weight the 39 hand-picked | +249.1% | −35.9% | 0.89 | +12.5% |
-| **Momentum on the 951** | **+329.2%** | −38.2% | **0.93** | **+28.7%** |
+For reference, the same engine at 100% invested, no vol cap and price ≥ $5 gives
++329.2% (maxDD −38.2%). The deployed filters give up return for a much smaller
+drawdown.
 
-**The edge is real — but roughly 40% of the headline was universe selection.**
-Expect ~+29%/yr alpha, not the hand-picked number.
+### Not the deployed system: the 39-name tables
+
+Earlier versions of this page led with returns of +1,072% (test) and +16,302%
+(full history). **Those are not the deployed configuration.** They come from a
+39-name universe hand-picked in 2026 (it contains the AI-era winners), and they run
+all three sleeves. They remain in `docs/STRATEGY_DETAIL.md` §6 as evidence for what
+each sleeve did in isolation. On the mechanical 951-name universe, roughly 40% of
+that headline alpha was universe selection (+45.7% → +28.7%/yr for the unfiltered
+top-6).
 
 ## What this is not
 
-- **Not market-neutral.** β 0.8. It falls when the market falls.
-- **Not low-drawdown.** −47% in the worst period. Most people cannot hold that.
+- **Not market-neutral.** It falls when the market falls (β 0.49 in the deployed
+  backtest, higher in other configurations).
+- **Not low-drawdown.** −16.5% in the deployed backtest, but −38% with the filters
+  off, and the 951-name history covers one ~5-year regime.
 - **Not a large-cap strategy.** Screening to big, calm names collapses the alpha
   to +1.3%/yr. The edge lives in volatility.
 - **Not proven in low-vol bull markets.** It lags when the market melts up.
-- **Not validated on real option prices.** No historical option chain exists on
-  this machine, so spread P&L is modelled with Black-Scholes. Treat it as an
-  estimate.
-- **Not yet filled in paper.** The three spreads submitted on 2026-08-28 all
-  expired unfilled. The execution defects behind that were fixed on 2026-09-03
-  (`docs/STRATEGY_DETAIL.md` §3.4.1), but until a spread actually fills, what is
-  running live is the momentum core plus the PEAD sleeve.
+- **Not a tested live result.** The backtest is on IEX daily bars and ignores
+  slippage beyond 5 bps. In paper, the account was liquidated by a stale-data bug
+  on 2026-09-14 (below) and has been in cash since; the monthly momentum book has
+  not yet run live.
+
+## Incident: 2026-09-14 stale-data liquidation
+
+The price cache was never refreshed (last bar 2026-08-27). On 2026-09-14 the
+"no bar for 15 days = delisted" test fired for every name, the ranking came back
+empty, and the strategy sold every holding as "no longer in the top-N". Two more
+defects sat behind it: the live agents exited any name outside the top 6 on every
+cycle (the backtest only does so monthly), and delisting was measured against the
+wall clock instead of the data. Fixed 2026-09-30: prices refresh each cycle, stale
+data fails closed, delisting is measured from the newest SPY bar, and the stock
+book follows the 21-day calendar. Regression tests: `tests/test_agents.py`,
+`tests/test_data_refresh.py`.
 
 ## Safety
 

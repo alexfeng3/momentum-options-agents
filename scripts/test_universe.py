@@ -22,12 +22,15 @@ BROAD = ROOT / "data" / "broad"
 
 def momentum(book, syms, S, E, top_n=6, rebal=21, market_filter=True,
              start_equity=100_000.0, cost_bps=5.0, min_px=5.0,
-             max_vol=None, min_dv=0.0):
+             max_vol=None, min_dv=0.0, invest=1.0):
     """Delisting is handled at LAST TRADED PRICE, not zero.
 
     Marking a delisted holding to zero books total losses on acquisitions
     (ATVI, VMW, XLNX, TWTR all just stop having bars) and manufactured a fake
     -76% drawdown in an earlier version of this script.
+
+    `invest` is the fraction of cash put to work at each rebalance (the deployed
+    system uses 0.80; the rest stays in cash). 1.0 is the original behaviour.
     """
     days = [d for d in book.days if S <= d <= E]
     cash, hold, last, curve = start_equity, {}, None, []
@@ -64,7 +67,7 @@ def momentum(book, syms, S, E, top_n=6, rebal=21, market_filter=True,
                 cands[s] = c
             picks = rank(cands, book.closes_until("SPY", d, 300), top_n) if (cands and ok) else []
             if picks:
-                per = cash / len(picks)
+                per = cash * invest / len(picks)
                 for p in picks:
                     px = book.close(p.symbol, d)
                     q = per / (px * (1 + cost_bps / 10_000))

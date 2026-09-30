@@ -1,9 +1,14 @@
 # Momentum + Options Agents
 
-An agentic trading system for US equities and defined-risk options, built on
-Alpaca's Trading API. Five agents pick names by momentum and post-earnings drift,
-sell defined-risk put spreads against them, and enforce hard capital limits before
-anything reaches the broker.
+An agentic trading system for US equities, built on Alpaca's Trading API. Five
+agents rank stocks by momentum, propose trades, and enforce hard capital limits
+before anything reaches the broker.
+
+**What runs today (since 2026-09-30): the momentum core only** — top 6 names, 80%
+of equity, rebalanced every 21 days. The post-earnings-drift (PEAD) sleeve and the
+put-spread overlay described below are built and tested but **switched off**
+(`pead_enabled`, `overlay_enabled`). Open spreads are still closed by the exit
+rules.
 
 **Paper trading only.** Four independent gates must pass before a single order can
 leave the process. There is no live-trading code path.
@@ -12,7 +17,7 @@ leave the process. There is no live-trading code path.
 
 ## The strategy
 
-**Core sleeve — momentum.** Every rebalance, score every liquid name on
+**Core sleeve — momentum (the only sleeve running).** Every rebalance, score every liquid name on
 point-in-time momentum:
 
 ```
@@ -25,16 +30,29 @@ score = 0.45 × (12-1 month return / vol)   ← 12-month return, SKIPPING the la
 The last month is skipped because of short-term reversal; dividing by 60-day
 realised volatility stops a lottery ticket outranking a compounder for being
 noisy. Hold the top N equal-weight. If SPY is below its own 200-day SMA, hold
-**cash** and skip the cycle.
+**cash**.
 
-**Alpha sleeve — PEAD.** Post-earnings announcement drift, on **real SEC data**.
+**Monthly, as backtested.** The backtest ranks and trades once every 21 calendar
+days and holds in between; the live agents do the same. The cron job wakes three
+times a day, but ranking, exits, entries and the SPY-200 check happen only on a
+rebalance cycle (none recorded, 21+ days since the last, or the same day as it).
+The last rebalance date is kept in `state/rebalance.json`, written only by a live
+cycle with the market open and fresh data.
+
+**Data is refreshed every cycle and fails closed.** Rankings come from the CSV
+cache in `data/broad/`. Each cycle first appends the newly finished sessions
+(never today's partial bar) and re-fetches a symbol's whole history if a split
+changed its prices. If the newest SPY bar is still more than 5 days old, the
+cycle proposes **no stock trades at all** and says so (`data_stale`).
+
+**Alpha sleeve — PEAD (switched off).** Post-earnings announcement drift, on **real SEC data**.
 `scripts/fetch_earnings.py` pulls quarterly diluted EPS and filing dates from
 EDGAR's XBRL API. Surprise is measured two ways and both must agree: **SUE**
 (seasonal random walk, Bernard & Thomas 1989) from the reported EPS, and a
 volume-confirmed announcement gap. Entry is the day *after* the detected
 announcement, so the strategy captures the drift and never the jump.
 
-**Options overlay.** Short 20-delta put credit spreads on names the model already
+**Options overlay (switched off for new spreads).** Short 20-delta put credit spreads on names the model already
 holds — bullish exposure with *positive* theta instead of paying it. Max loss is
 the spread width, always.
 
@@ -159,10 +177,17 @@ python -m options_agents.cli status
 ```
 
 ```bash
+python scripts/run_deployed_config.py
+```
+Backtest **what is deployed now** — momentum core only, monthly rebalance, 951
+mechanical names, exactly the live filters — plus the spread of results when the
+first rebalance is shifted by 0-20 trading days. About four minutes.
+
+```bash
 python scripts/run_live_config.py
 ```
-Backtest **the deployed configuration** — all three sleeves sharing one pot of
-capital. This is the one that matches what the agents run.
+The older three-sleeve backtest (39 hand-picked names, overlay and PEAD on). It is
+**not** what runs today.
 
 ```bash
 python scripts/report.py
@@ -211,12 +236,16 @@ Read these before believing any number in this repo.
    option chain is available, so Black-Scholes on a volatility surface built from
    VIX/VXN (index) or realised vol × 1.10 (single names). Frictions are charged
    both ways, but this is an edge estimate, not an achievable P&L.
-4. **The overlay has not filled in paper yet.** Three spreads were submitted on
-   2026-08-28 and all three expired unfilled; the causes were execution defects,
-   fixed on 2026-09-03 and pinned by regression tests
-   (`docs/STRATEGY_DETAIL.md` §3.4.1). Until spreads actually fill, every overlay
-   number in this repo is a model output and the live system is a momentum book
-   with a PEAD sleeve.
+4. **The overlay never filled reliably in paper, and is now off.** Only 1 of 22
+   overlay orders filled. Three spreads submitted on 2026-08-28 expired unfilled
+   (execution defects, fixed 2026-09-03, `docs/STRATEGY_DETAIL.md` §3.4.1). Every
+   overlay number in this repo is a model output. The PEAD sleeve is also off:
+   earnings data exists for only 32 names, unrelated to the ranked universe, so it
+   cannot fire.
+9. **Stale prices once liquidated the account.** The price cache was never
+   refreshed; on 2026-09-14 every name looked delisted, the ranking came back
+   empty and the agents sold every holding. Fixed 2026-09-30 (refresh each cycle,
+   staleness guard, monthly rebalance). See `docs/STRATEGY_DETAIL.md` §10.
 5. **The strategy is high-beta and high-drawdown.** −38% on the broad universe. It
    maximises return, not survivability.
 6. **It underperforms in low-volatility melt-ups**, when the market runs away from
@@ -237,6 +266,8 @@ src/options_agents/
   selection.py        point-in-time momentum scoring
   earnings.py         SEC XBRL events, SUE, announcement detection
   spreads.py          pairs broker option legs back into spreads; exit pricing
+  refresh.py          appends finished sessions to data/broad each cycle
+  rebalance.py        21-day rebalance calendar (state/rebalance.json)
   llm.py              Judgment Agent; abstains without a key
   agents/             the five agents, one file each
   orchestrator.py     wires one cycle

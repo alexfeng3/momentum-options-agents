@@ -24,6 +24,19 @@ def _print(res, cfg):
           f"market={'OPEN' if res['market_open'] else 'CLOSED'}  "
           f"regime={'RISK-ON' if res['spy_above_sma200'] else 'RISK-OFF (SPY<SMA200)'}\n{BAR}")
 
+    if res.get("data_stale"):
+        print(f"\n*** STALE PRICE DATA: newest bar {res.get('newest_bar')} — no stock "
+              f"trades proposed, spread exits only ***")
+    else:
+        print(f"\nprice data through {res.get('newest_bar')}")
+    if res.get("is_rebalance") and res.get("data_stale"):
+        print("rebalance due, but skipped until the data is fresh")
+    elif res.get("is_rebalance"):
+        print("REBALANCE CYCLE (ranks, exits and entries allowed)")
+    else:
+        print(f"not a rebalance cycle — stock book left alone; next rebalance "
+              f"{res.get('next_rebalance')}")
+
     snap = res["snapshot"]
     print(f"\nTOP MOMENTUM ({len(snap['ranked'])} scored from {len(cfg.universe)} names)")
     print(f"  {'sym':<7}{'score':>8}{'12-1':>9}{'3m':>9}{'vol':>8}{'IVrank':>8}{'px':>10}")

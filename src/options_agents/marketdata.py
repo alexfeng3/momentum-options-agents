@@ -81,12 +81,21 @@ class HistoricalBook:
         prior = [x for x in rec if x <= d]
         return rec[max(prior)]["close"] if prior else None
 
+    def newest_date(self, sym: str = "SPY") -> date | None:
+        """Date of the newest bar held for `sym`, or None if there is none."""
+        rec = self.px.get(sym)
+        return max(rec) if rec else None
+
     def is_delisted(self, sym: str, d: date, stale_days: int = 15) -> bool:
         """True only if the series went quiet well before `d`.
 
         A tolerance is essential: the newest bar is normally the PREVIOUS session,
         so a naive `max(rec) < d` marks the entire universe delisted and silently
         scores zero candidates.
+
+        Live code must pass the book's own newest date (`newest_date("SPY")`), not
+        the wall clock. Against the wall clock a stale cache looks like every name
+        delisting at once, which is how the whole account was sold on 2026-09-14.
         """
         rec = self.px.get(sym)
         if not rec:

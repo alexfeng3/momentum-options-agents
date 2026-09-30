@@ -10,6 +10,15 @@ Turns the market snapshot into concrete proposals:
              idle (see docs/DIRECTIONAL.md — the overlay is a drag on a fully
              invested momentum book, and additive on the cash-heavy PEAD sleeve).
 
+The stock book follows the backtest calendar (scripts/test_universe.py::momentum):
+ranking, rank exits, entries, trims and the SPY-200 regime check happen only when
+`rebalance` is True, and never when the snapshot's price data is stale. Between
+rebalances the stock book is left alone. Spread exits run on every cycle either
+way: they are priced from live option quotes and only reduce risk.
+
+CORE is the deployed sleeve. PEAD and SPREAD are off by default (`pead_enabled`,
+`overlay_enabled`).
+
 Applies the rules only. Checks no risk limits, sizes nothing against the live
 account, and places no orders. Pure enough to be reused by the backtester.
 """
@@ -49,7 +58,8 @@ class StrategyAgent:
             held_value: dict[str, float] | None = None,
             equity: float | None = None,
             held_options: set[str] | None = None,
-            open_spreads: list | None = None) -> list[Proposal]:
+            open_spreads: list | None = None,
+            rebalance: bool = True) -> list[Proposal]:
         """`held_value` is the CURRENT dollar value of each holding and `equity`
         the account total. Without them the agent cannot tell a fresh entry from
         a position already at target weight, and re-buys the whole book every
@@ -59,6 +69,10 @@ class StrategyAgent:
         position, so the overlay does not stack a second spread on a name.
         `open_spreads` are those positions paired back into spreads, each already
         carrying its legs' quotes, so the exit rules can be applied to them.
+
+        `rebalance` says whether this cycle is a rebalance cycle (the caller works
+        that out from the recorded last-rebalance date). When False, or when
+        `snap.data_stale`, only spread exits are proposed.
         """
         cfg = self.cfg
         out: list[Proposal] = []
@@ -70,6 +84,26 @@ class StrategyAgent:
         # Runs BEFORE the regime gate: an open short spread is a live liability
         # and taking it off is risk-reducing in every regime.
         out.extend(self._spread_exits(open_spreads, as_of))
+
+        # ---- fail closed on stale prices --------------------------------------
+        # A ranking built from an old cache is not a ranking. Selling on it is
+        # what liquidated the whole account on 2026-09-14, so no stock trade of
+        # any kind (buy, exit, trim) is proposed.
+        if snap.data_stale:
+            self.log.emit(self.name, "proposals",
+                          {"regime": "data_stale", "newest_bar": snap.newest_bar,
+                           "count": len(out), "all": [p.to_dict() for p in out]})
+            return out
+
+        # ---- between rebalances the stock book is left alone -------------------
+        # The backtest ranks and trades once every rebalance_days and holds in
+        # between. Exiting a name the moment it slips out of the top N, every
+        # cycle, is a different (much higher turnover) strategy.
+        if not rebalance:
+            self.log.emit(self.name, "proposals",
+                          {"regime": "not_rebalance_cycle", "count": len(out),
+                           "all": [p.to_dict() for p in out]})
+            return out
 
         # ---- regime gate: SPY below its 200-day SMA means no new risk --------
         if cfg.market_filter and not snap.spy_above_sma200:
@@ -126,25 +160,26 @@ class StrategyAgent:
                                     {"in_ranking": False}))
 
         # ---- PEAD sleeve -----------------------------------------------------
-        for sym, n in snap.names.items():
-            e = n.recent_earnings
-            if not e or e.get("days_since", 99) > cfg.pead_entry_days:
-                continue
-            if (e.get("sue") or -9) < cfg.sue_min:
-                continue
-            if (e.get("gap_pct") or -9) < cfg.gap_min:
-                continue
-            if (e.get("vol_ratio") or 0) < cfg.vol_ratio_min:
-                continue
-            if sym in picks:
-                continue
-            out.append(Proposal(
-                sym, "PEAD", "BUY", cfg.pead_weight,
-                f"Post-earnings drift: SUE {e['sue']:+.2f} with a "
-                f"{e['gap_pct']:+.1%} volume-confirmed gap "
-                f"({e['vol_ratio']:.1f}x) {e['days_since']}d ago.",
-                {"sue": e["sue"], "gap_pct": e["gap_pct"],
-                 "vol_ratio": e["vol_ratio"], "days_since": e["days_since"]}))
+        if cfg.pead_enabled:
+            for sym, n in snap.names.items():
+                e = n.recent_earnings
+                if not e or e.get("days_since", 99) > cfg.pead_entry_days:
+                    continue
+                if (e.get("sue") or -9) < cfg.sue_min:
+                    continue
+                if (e.get("gap_pct") or -9) < cfg.gap_min:
+                    continue
+                if (e.get("vol_ratio") or 0) < cfg.vol_ratio_min:
+                    continue
+                if sym in picks:
+                    continue
+                out.append(Proposal(
+                    sym, "PEAD", "BUY", cfg.pead_weight,
+                    f"Post-earnings drift: SUE {e['sue']:+.2f} with a "
+                    f"{e['gap_pct']:+.1%} volume-confirmed gap "
+                    f"({e['vol_ratio']:.1f}x) {e['days_since']}d ago.",
+                    {"sue": e["sue"], "gap_pct": e["gap_pct"],
+                     "vol_ratio": e["vol_ratio"], "days_since": e["days_since"]}))
 
         # ---- defined-risk short put spreads ---------------------------------
         # Candidates are the names the model WANTS TO BE LONG, not the names it

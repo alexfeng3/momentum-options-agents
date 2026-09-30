@@ -36,6 +36,10 @@ class LiveConfig:
     core_weight: float = 0.80        # fraction of equity in the core sleeve
     max_positions: int = 10
     max_position_pct: float = 0.20
+    # The backtest (scripts/test_universe.py::momentum) rebalances every 21 calendar
+    # days and does nothing in between. The live agents follow the same calendar:
+    # ranking, rank exits, new entries and the SPY regime check happen only on a
+    # rebalance cycle. The last rebalance date is kept in `rebalance_file`.
     rebalance_days: int = 21
     # Do not trade a position already within this fraction of its target weight.
     # Without a band the book churns every cycle and pays costs for nothing.
@@ -43,6 +47,9 @@ class LiveConfig:
     market_filter: bool = True
 
     # --- PEAD sleeve -----------------------------------------------------
+    # Off: earnings data exists for only 32 names outside the universe, so the
+    # sleeve cannot fire on the names actually ranked.
+    pead_enabled: bool = False
     pead_weight: float = 0.05
     pead_window: int = 10            # look back this far for a recent event
     pead_entry_days: int = 3         # enter within N days of the announcement
@@ -51,7 +58,10 @@ class LiveConfig:
     vol_ratio_min: float = 1.3
 
     # --- options overlay -------------------------------------------------
-    overlay_enabled: bool = True
+    # Off: 1 of 22 overlay orders filled in paper, and on a fully invested
+    # momentum book it is not reliably additive (docs/STRATEGY_DETAIL.md 6.5).
+    # This only stops NEW spreads. Open spreads are still closed.
+    overlay_enabled: bool = False
     short_delta: float = 0.20
     width_pct: float = 0.10
     # Hard cap on spread width in dollars. Without it, high-priced names produce
@@ -76,6 +86,17 @@ class LiveConfig:
     profit_target: float = 0.50      # buy it back once half the credit is earned
     close_dte: int = 5               # and always close this close to expiry
 
+    # --- price data ------------------------------------------------------
+    # The rankings come from a local CSV cache (data_dir). It is refreshed at the
+    # start of every cycle. If the newest SPY bar is more than max_data_age_days
+    # older than today the cache is not trusted and NO stock trades are proposed.
+    max_data_age_days: int = 5
+    history_start: str = "2020-08-01"   # same start as scripts/fetch_broad_universe.py
+    refresh_batch: int = 150
+    # If a cached close and the freshly fetched close for the same date differ by
+    # more than this, the cached history is in stale (pre-split) units: refetch.
+    split_tolerance: float = 0.005
+
     # --- capital ---------------------------------------------------------
     cash_floor: float = 0.02         # always keep this fraction unspent
     min_ticket: float = 100.0
@@ -84,6 +105,7 @@ class LiveConfig:
     coid_prefix: str = "moqa"        # momentum-options quant agent
     fill_poll_seconds: float = 8.0
     data_dir: Path = field(default_factory=lambda: ROOT / "data" / "broad")
+    rebalance_file: Path = field(default_factory=lambda: ROOT / "state" / "rebalance.json")
 
     @classmethod
     def from_env(cls, universe: tuple[str, ...]) -> "LiveConfig":
@@ -94,7 +116,8 @@ class LiveConfig:
             max_positions=_i("MAX_POSITIONS", 10),
             max_position_pct=_f("MAX_POSITION_PCT", 0.20),
             market_filter=_b("MARKET_FILTER", True),
-            overlay_enabled=_b("OVERLAY_ENABLED", True),
+            pead_enabled=_b("PEAD_ENABLED", False),
+            overlay_enabled=_b("OVERLAY_ENABLED", False),
             short_delta=_f("SHORT_DELTA", 0.20),
             width_pct=_f("WIDTH_PCT", 0.10),
             dte=_i("DTE", 30),

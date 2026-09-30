@@ -40,6 +40,17 @@ def money(x) -> str:
         return "?"
 
 
+def rebalance_line(res: dict) -> str:
+    """Whether this was a rebalance cycle, and when the next one is due."""
+    nxt = res.get("next_rebalance")
+    if res.get("data_stale") and res.get("is_rebalance"):
+        return "rebalance due but SKIPPED (stale data) — will retry next cycle"
+    if res.get("is_rebalance"):
+        tail = f"next rebalance {nxt}" if nxt else "not recorded yet (dry run or market closed)"
+        return f"rebalance cycle: YES · {tail}"
+    return f"rebalance cycle: no · next rebalance {nxt or '?'}"
+
+
 def render(res: dict) -> str:
     acct = (res.get("summary") or {}).get("account") or {}
     expo = (res.get("summary") or {}).get("exposure") or {}
@@ -52,6 +63,13 @@ def render(res: dict) -> str:
 
     L = [f"📊 **Hedge Fund** · {res.get('as_of')} · {mode}",
          f"regime {regime} · market {mkt} · run `{res.get('run_id')}`"]
+
+    # The strategy fails closed when its price cache is too old: it proposes no
+    # stock trades at all. That must be impossible to miss.
+    if res.get("data_stale"):
+        L.append(f"🚨 **STALE PRICE DATA** — newest bar {res.get('newest_bar')}. "
+                 f"No stock trades proposed; only spread exits ran.")
+    L.append(rebalance_line(res))
 
     submitted = [o for o in orders
                  if o.get("status") not in ("dry_run", "error", "skipped_duplicate")]

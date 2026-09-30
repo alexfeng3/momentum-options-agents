@@ -41,6 +41,10 @@ class MarketSnapshot:
     names: dict[str, NameSnapshot] = field(default_factory=dict)
     ranked: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Newest SPY bar in the cache, and whether it is too old to trade on. When
+    # stale, the strategy agent proposes no stock trades at all.
+    newest_bar: str | None = None
+    data_stale: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -64,12 +68,25 @@ class MarketDataAgent:
             self.log.emit(self.name, "clock_failed", {"error": str(e)})
             is_open = False
 
+        # How fresh is the cache? Measured from the newest SPY bar, and every
+        # name's delisting test is measured from that same date. Against the wall
+        # clock, one stale cache made all 951 names look delisted at once.
+        newest = self.book.newest_date("SPY")
+        stale = newest is None or (as_of - newest).days > cfg.max_data_age_days
+        if stale:
+            self.log.emit(self.name, "data_stale", {
+                "newest_bar": newest.isoformat() if newest else None,
+                "as_of": as_of.isoformat(),
+                "age_days": (as_of - newest).days if newest else None,
+                "max_age_days": cfg.max_data_age_days,
+                "effect": "no stock trades will be proposed; spread exits still run"})
+
         spy = self.book.closes_until("SPY", as_of, 300)
         spy_ok = len(spy) >= 200 and spy[-1] > sum(spy[-200:]) / 200
 
         cands: dict[str, list[float]] = {}
         for s in cfg.universe:
-            if self.book.is_delisted(s, as_of):
+            if newest is None or self.book.is_delisted(s, newest):
                 continue
             c = self.book.closes_until(s, as_of, 300)
             if len(c) >= 260 and c[-1] >= cfg.min_price:
@@ -93,18 +110,19 @@ class MarketDataAgent:
                         hist.append(h * cfg.iv_premium)
             ivh[sc.symbol] = hist
             ev = None
-            try:
-                evs = [e for e in build_events(sc.symbol, self.book)
-                       if e.announce_date and
-                       as_of - timedelta(days=cfg.pead_window) <= e.announce_date <= as_of]
-                if evs:
-                    e = evs[-1]
-                    ev = {"announce_date": e.announce_date.isoformat(),
-                          "days_since": (as_of - e.announce_date).days,
-                          "eps": e.eps, "sue": e.sue, "yoy_growth": e.yoy_growth,
-                          "gap_pct": e.gap_pct, "vol_ratio": e.vol_ratio}
-            except Exception:
-                ev = None
+            if cfg.pead_enabled:          # earnings events are only used by PEAD
+                try:
+                    evs = [e for e in build_events(sc.symbol, self.book)
+                           if e.announce_date and
+                           as_of - timedelta(days=cfg.pead_window) <= e.announce_date <= as_of]
+                    if evs:
+                        e = evs[-1]
+                        ev = {"announce_date": e.announce_date.isoformat(),
+                              "days_since": (as_of - e.announce_date).days,
+                              "eps": e.eps, "sue": e.sue, "yoy_growth": e.yoy_growth,
+                              "gap_pct": e.gap_pct, "vol_ratio": e.vol_ratio}
+                except Exception:
+                    ev = None
             names[sc.symbol] = NameSnapshot(
                 symbol=sc.symbol, last_price=c[-1], momentum_score=sc.total,
                 mom_12_1=sc.mom_12_1, mom_3m=sc.mom_3m, trend=sc.trend,
@@ -115,10 +133,12 @@ class MarketDataAgent:
         snap = MarketSnapshot(
             as_of=as_of.isoformat(), market_open=is_open,
             spy_above_sma200=spy_ok, spy_price=spy[-1] if spy else None,
-            names=names, ranked=[s.symbol for s in scored])
+            names=names, ranked=[s.symbol for s in scored],
+            newest_bar=newest.isoformat() if newest else None, data_stale=stale)
         self.log.emit(self.name, "snapshot", {
             "as_of": snap.as_of, "market_open": is_open,
             "spy_above_sma200": spy_ok, "universe_size": len(cfg.universe),
+            "newest_bar": snap.newest_bar, "data_stale": stale,
             "candidates_scored": len(scored),
             "top": [{"symbol": s.symbol,
                      "score": round(s.total, 4),

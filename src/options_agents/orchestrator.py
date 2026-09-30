@@ -15,6 +15,9 @@ from .broker import AlpacaBroker
 from .eventlog import ET, EventLog
 from .marketdata import HistoricalBook
 from .portfolio import Portfolio
+from .rebalance import (is_rebalance_cycle, load_last_rebalance,
+                        next_rebalance_date, save_last_rebalance)
+from .refresh import refresh_bars
 from .spreads import debit_to_close, pair_spreads
 from .strategy_config import LiveConfig
 
@@ -34,14 +37,33 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
     log.emit("orchestrator", "cycle_start", {
         "run_id": run_id, "dry_run": dry_run, "mode": "paper",
         "universe_size": len(cfg.universe), "top_n": cfg.top_n,
-        "overlay_enabled": cfg.overlay_enabled, "now_et": now.isoformat()})
+        "overlay_enabled": cfg.overlay_enabled, "pead_enabled": cfg.pead_enabled,
+        "now_et": now.isoformat()})
 
     broker = AlpacaBroker()
     acct = broker.verify_paper()                       # 4 gates, or abort
     log.emit("orchestrator", "paper_verified",
              {"account_number": acct["account_number"], "base_url": broker.base})
 
-    book = HistoricalBook(list(cfg.universe) + ["SPY"], data_dir=Path(cfg.data_dir))
+    # 0. Bring the price cache up to the last completed session. A failure here
+    #    must not stop the cycle: the staleness guard decides whether the cache
+    #    that is left is still good enough to trade on.
+    symbols = sorted(set(cfg.universe) | {"SPY"})
+    refresh = None
+    try:
+        refresh = refresh_bars(broker, symbols, cfg, as_of)
+        log.emit("orchestrator", "data_refresh", {
+            "symbols_updated": refresh["updated"], "bars_added": refresh["bars_added"],
+            "symbols_rewritten": len(refresh["rewritten"]),
+            "rewritten": refresh["rewritten"],
+            "rewrite_skipped": refresh["rewrite_skipped"],
+            "dead_skipped": refresh["dead_skipped"],
+            "batch_errors": refresh["batch_errors"],
+            "newest_bar": refresh["newest_bar"]})
+    except Exception as e:
+        log.emit("orchestrator", "data_refresh_failed", {"error": str(e)})
+
+    book = HistoricalBook(symbols, data_dir=Path(cfg.data_dir))
 
     # 1. Market Data Agent
     snap = MarketDataAgent(broker, book, cfg, log).run(as_of)
@@ -81,13 +103,23 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
                  {"count": len(open_spreads),
                   "spreads": [sp.to_dict() for sp in open_spreads]})
 
+    # Rebalance calendar: the stock book is only re-ranked and traded every
+    # rebalance_days, as in the backtest.
+    last_rebalance = load_last_rebalance(cfg.rebalance_file)
+    is_rebalance = is_rebalance_cycle(as_of, last_rebalance, cfg.rebalance_days)
+    log.emit("orchestrator", "rebalance_check", {
+        "is_rebalance": is_rebalance,
+        "last_rebalance": last_rebalance.isoformat() if last_rebalance else None,
+        "rebalance_days": cfg.rebalance_days})
+
     # 2. Strategy Agent
     held_value = {p["symbol"]: float(p["market_value"]) for p in positions
                   if p.get("asset_class") != "us_option"}
     proposals = StrategyAgent(cfg, log).run(snap, held, book, as_of,
                                             held_value=held_value, equity=equity,
                                             held_options=held_options,
-                                            open_spreads=open_spreads)
+                                            open_spreads=open_spreads,
+                                            rebalance=is_rebalance)
 
     # 3. Judgment Agent (LLM) — veto only, abstains without a key
     review = None
@@ -123,11 +155,27 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
     # 5. Execution Agent — approved only
     orders = ExecutionAgent(broker, cfg, log, dry_run=dry_run).run(decisions, snap)
 
+    # Record the rebalance only once it has really been attempted: a live cycle,
+    # market open, fresh data. Dry runs and closed-market runs leave no trace.
+    recorded = False
+    if is_rebalance and not dry_run and snap.market_open and not snap.data_stale:
+        save_last_rebalance(cfg.rebalance_file, as_of)
+        last_rebalance, recorded = as_of, True
+        log.emit("orchestrator", "rebalance_recorded", {"last_rebalance": as_of.isoformat()})
+    next_rebalance = next_rebalance_date(last_rebalance, cfg.rebalance_days)
+    if is_rebalance and not recorded and last_rebalance != as_of:
+        next_rebalance = None       # this rebalance has not happened yet
+
     # 6. Position Analysis Agent
     summary = PositionAgent(broker, cfg, log).run(snap, as_of)
 
     result = {"run_id": run_id, "dry_run": dry_run, "as_of": as_of.isoformat(),
               "market_open": snap.market_open,
+              "data_stale": snap.data_stale, "newest_bar": snap.newest_bar,
+              "data_refresh": refresh,
+              "is_rebalance": is_rebalance,
+              "last_rebalance": last_rebalance.isoformat() if last_rebalance else None,
+              "next_rebalance": next_rebalance.isoformat() if next_rebalance else None,
               "spy_above_sma200": snap.spy_above_sma200,
               "snapshot": snap.to_dict(),
               "llm": {"available": bool(review and review.available),
@@ -139,6 +187,7 @@ def run_cycle(cfg: LiveConfig, dry_run: bool = True, echo: bool = True,
               "orders": [o.to_dict() for o in orders],
               "summary": summary, "log_file": str(log.path)}
     log.emit("orchestrator", "cycle_end", {
+        "data_stale": snap.data_stale, "is_rebalance": is_rebalance,
         "proposals": len(proposals),
         "approved": sum(1 for d in decisions if d.approved),
         "rejected": sum(1 for d in decisions if not d.approved),

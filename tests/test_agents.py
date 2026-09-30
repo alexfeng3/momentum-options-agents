@@ -483,3 +483,174 @@ def test_overlay_does_not_reopen_a_spread_it_is_closing_this_cycle():
         open_spreads=[_open_spread(mid=0.17)])
     assert any(p.kind == "SPREAD_EXIT" for p in props)
     assert not any(p.kind == "SPREAD" for p in props)
+
+
+# ---------------------------------------------- rebalance calendar and stale data
+# 2026-09-14: the price cache went stale, every name looked delisted, the ranking
+# came back empty and the strategy agent sold the whole account as "no longer in
+# the top-N". The backtest only trades once every 21 days; the live agents were
+# trading every cycle. Both are pinned here.
+
+def _run_strategy(cfg, held, held_value, *, ranked=("AAA",), rebalance=True,
+                  stale=False, spy_ok=True, open_spreads=None, snap=None,
+                  as_of=date(2026, 9, 30)):
+    from options_agents.agents.strategy import StrategyAgent
+    px = {s: 100.0 for s in set(ranked) | set(held)}
+    snap = snap or _snap(list(ranked), px)
+    snap.data_stale, snap.spy_above_sma200 = stale, spy_ok
+    return StrategyAgent(cfg, NullLog()).run(
+        snap, held, _Book(), as_of, held_value=held_value, equity=100_000.0,
+        open_spreads=open_spreads, rebalance=rebalance)
+
+
+def _kinds(props):
+    return sorted(p.kind for p in props)
+
+
+def test_stale_data_proposes_no_stock_trades_and_liquidates_nothing():
+    """THE 2026-09-14 regression: held names must survive a stale cache."""
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1, core_weight=0.8)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0}, stale=True)
+    assert props == [], "stale data: no buys, no exits, no trims"
+
+
+def test_stale_data_also_blocks_the_regime_exit():
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0}, stale=True,
+                          spy_ok=False)
+    assert props == []
+
+
+def test_stale_data_still_closes_an_open_spread():
+    """Spread exits are priced from live option quotes and only reduce risk."""
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0}, stale=True,
+                          open_spreads=[_open_spread(mid=0.17)],
+                          as_of=date(2026, 9, 3))
+    assert _kinds(props) == ["SPREAD_EXIT"]
+
+
+def test_between_rebalances_nothing_is_exited_bought_or_trimmed():
+    """BBB has left the top 1 and AAA is unowned, but it is not rebalance day."""
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1, core_weight=0.8)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0}, rebalance=False)
+    assert props == []
+
+
+def test_between_rebalances_the_regime_check_does_not_sell_either():
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0},
+                          rebalance=False, spy_ok=False)
+    assert props == []
+
+
+def test_between_rebalances_an_overweight_position_is_not_trimmed():
+    cfg = LiveConfig(universe=("AAA",), top_n=1, core_weight=0.5)
+    props = _run_strategy(cfg, {"AAA": 900.0}, {"AAA": 90_000.0}, rebalance=False)
+    assert props == []
+
+
+def test_between_rebalances_a_spread_is_still_closed():
+    cfg = LiveConfig(universe=("AAA",), top_n=1)
+    props = _run_strategy(cfg, {}, {}, rebalance=False, ranked=("AAA",),
+                          open_spreads=[_open_spread(mid=0.17)],
+                          as_of=date(2026, 9, 3))
+    assert _kinds(props) == ["SPREAD_EXIT"]
+
+
+def test_rebalance_day_exits_the_dropped_name_and_buys_the_new_one():
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1, core_weight=0.8)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0}, rebalance=True)
+    assert [(p.kind, p.symbol) for p in props] == [("CORE", "AAA"), ("EXIT", "BBB")]
+
+
+def test_rebalance_day_in_a_bear_market_exits_everything():
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1)
+    props = _run_strategy(cfg, {"BBB": 100.0}, {"BBB": 10_000.0},
+                          rebalance=True, spy_ok=False)
+    assert [(p.kind, p.symbol) for p in props] == [("EXIT", "BBB")]
+
+
+def test_flat_account_with_no_recorded_rebalance_buys_the_top_six():
+    """Today's situation: cash only, no state file. Buys top 6 at 80% / 6."""
+    ranked = ["A1", "A2", "A3", "A4", "A5", "A6", "A7"]
+    cfg = LiveConfig(universe=tuple(ranked), top_n=6, core_weight=0.80)
+    from options_agents.rebalance import is_rebalance_cycle
+    assert is_rebalance_cycle(date(2026, 9, 30), None, cfg.rebalance_days)
+    props = _run_strategy(cfg, {}, {}, ranked=ranked, rebalance=True)
+    assert _kinds(props) == ["CORE"] * 6
+    assert {p.symbol for p in props} == set(ranked[:6])
+    assert all(p.target_weight == pytest.approx(0.80 / 6) for p in props)
+
+
+def test_second_cycle_on_rebalance_day_does_not_rebuy_what_filled():
+    """as_of == last_rebalance is still a rebalance cycle (so a partial fill can
+    be completed), and the 25% band is what stops it buying the book twice."""
+    from options_agents.rebalance import is_rebalance_cycle
+    day = date(2026, 9, 30)
+    assert is_rebalance_cycle(day, day, 21)
+    cfg = LiveConfig(universe=("AAA",), top_n=1, core_weight=0.8)
+    props = _run_strategy(cfg, {"AAA": 800.0}, {"AAA": 80_000.0}, rebalance=True)
+    assert props == []
+
+
+def test_rebalance_calendar():
+    from options_agents.rebalance import is_rebalance_cycle, next_rebalance_date
+    last = date(2026, 9, 1)
+    assert is_rebalance_cycle(date(2026, 9, 1), last, 21)         # same day
+    assert not is_rebalance_cycle(date(2026, 9, 2), last, 21)
+    assert not is_rebalance_cycle(date(2026, 9, 21), last, 21)    # 20 days
+    assert is_rebalance_cycle(date(2026, 9, 22), last, 21)        # 21 days
+    assert is_rebalance_cycle(date(2026, 9, 30), None, 21)        # never recorded
+    assert next_rebalance_date(last, 21) == date(2026, 9, 22)
+    assert next_rebalance_date(None, 21) is None
+
+
+def test_rebalance_state_round_trips_and_survives_a_bad_file(tmp_path):
+    from options_agents.rebalance import load_last_rebalance, save_last_rebalance
+    f = tmp_path / "state" / "rebalance.json"
+    assert load_last_rebalance(f) is None                          # no file
+    save_last_rebalance(f, date(2026, 9, 30))
+    assert load_last_rebalance(f) == date(2026, 9, 30)
+    f.write_text("not json")
+    assert load_last_rebalance(f) is None                          # unreadable
+
+
+# --------------------------------------------- overlay and PEAD switched off
+def _pead_snap():
+    snap = _snap(["AAA", "BBB"], {"AAA": 100.0, "BBB": 100.0})
+    snap.names["BBB"].recent_earnings = {"days_since": 1, "sue": 2.0,
+                                         "gap_pct": 0.05, "vol_ratio": 3.0}
+    return snap
+
+
+def test_overlay_and_pead_are_off_by_default(monkeypatch):
+    cfg = LiveConfig()
+    assert cfg.overlay_enabled is False and cfg.pead_enabled is False
+    monkeypatch.delenv("OVERLAY_ENABLED", raising=False)
+    monkeypatch.delenv("PEAD_ENABLED", raising=False)
+    cfg = LiveConfig.from_env(("AAA",))
+    assert cfg.overlay_enabled is False and cfg.pead_enabled is False
+
+
+def test_no_spread_or_pead_proposals_with_the_defaults():
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1, core_weight=0.8)
+    props = _run_strategy(cfg, {"AAA": 800.0}, {"AAA": 80_000.0}, snap=_pead_snap())
+    assert not any(p.kind in ("SPREAD", "PEAD") for p in props)
+
+
+def test_pead_proposals_return_only_when_enabled():
+    """Guards the test above: this snapshot does qualify for PEAD."""
+    cfg = LiveConfig(universe=("AAA", "BBB"), top_n=1, core_weight=0.8,
+                     pead_enabled=True)
+    props = _run_strategy(cfg, {"AAA": 800.0}, {"AAA": 80_000.0}, snap=_pead_snap())
+    assert any(p.kind == "PEAD" and p.symbol == "BBB" for p in props)
+
+
+def test_spread_exit_still_proposed_with_the_overlay_off():
+    cfg = LiveConfig(universe=("AAA",), top_n=1)
+    assert cfg.overlay_enabled is False
+    props = _run_strategy(cfg, {"AAA": 800.0}, {"AAA": 80_000.0},
+                          open_spreads=[_open_spread(mid=0.17)],
+                          as_of=date(2026, 9, 3))
+    assert [p.kind for p in props if p.kind.startswith("SPREAD")] == ["SPREAD_EXIT"]

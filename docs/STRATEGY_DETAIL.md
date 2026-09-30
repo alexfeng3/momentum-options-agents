@@ -4,13 +4,15 @@
 > document is the exhaustive version: every parameter, every backtest variant,
 > every failed experiment and every bug that produced a fake result.
 >
-> **The tables in §6 compare SLEEVES IN ISOLATION** so each one's contribution can
-> be attributed. None of those rows is the deployed system — the live
-> configuration runs all three sleeves together and is backtested in §6.6.
+> **The tables in §6.1–§6.6 are NOT the deployed system.** §6.1–§6.5 compare
+> sleeves in isolation; §6.6 runs all three sleeves on a hand-picked 39-name
+> universe. Since 2026-09-30 only the momentum core runs (overlay and PEAD are
+> off), rebalanced monthly on the 951-name universe. That configuration is
+> backtested in **§6.7**.
 
 # Momentum + PEAD + Defined-Risk Options Strategy
 
-**Last updated: 2026-09-03 | Status: PAPER ONLY (Alpaca paper, agent pipeline live) | Config: `momentum-top6 + core_weight 0.80 + PEAD/SUE sleeve + 20Δ put-spread overlay @ 15% max collateral`**
+**Last updated: 2026-09-30 | Status: PAPER ONLY (Alpaca paper, agent pipeline live) | Deployed config: `momentum-top6 + core_weight 0.80, monthly (21-day) rebalance, PEAD OFF, overlay OFF (open spreads still closed)`**
 
 This document is the authoritative reference for the strategy as backtested and as
 running in the agent pipeline. `AGENTS.md` covers operational setup; this document
@@ -25,7 +27,9 @@ control.** A return quoted without that control is misleading by construction; s
 
 ## 1. Strategy Overview
 
-Three components, each with a distinct job:
+Three components were built, each with a distinct job. **Only the first runs
+today** (`pead_enabled` and `overlay_enabled` default to False); the rest of this
+document describes the other two because they are built, tested and may return.
 
 1. **Momentum core (the return engine).** Rank a liquid universe on point-in-time
    momentum, hold the top N equal-weight, rebalance monthly, and sit in cash when
@@ -72,7 +76,26 @@ Runtime screens applied at selection time (`strategy_config.py`):
 | Minimum price | $10 | `min_price` |
 | Maximum 60d realised vol | 60% | `max_vol` |
 | Minimum history | 260 bars | (hard-coded in `selection.py`) |
-| Delisting staleness | >15 days without a bar | `HistoricalBook.is_delisted` |
+| Delisting staleness | >15 days behind the **newest SPY bar** (not the wall clock) | `HistoricalBook.is_delisted` |
+
+### 2.1.1 Price data and the staleness guard
+
+Rankings come from `data/broad/*.csv` (Alpaca IEX daily bars, `adjustment=split`).
+`refresh.py` runs at the start of every cycle:
+
+| Rule | Detail |
+|---|---|
+| Append | new finished sessions, fetched in batches of 150 symbols |
+| Never today | bars dated today (US/Eastern) or later are dropped; today's daily bar is partial |
+| Splits | the last cached date is re-fetched as an overlap; a close that differs by more than 0.5% means the history is in stale units, so that symbol's whole history is re-fetched from 2020-08-01 and rewritten |
+| No new bars | a delisted symbol is left alone; names >30 days behind the newest cached bar are not queried |
+| API error | logged (`data_refresh` / `data_refresh_failed`); the cycle continues on the existing cache |
+
+**Fail closed.** If the newest SPY bar is more than `max_data_age_days` (5) older
+than today, the market-data agent emits `data_stale` and the strategy agent
+proposes **no stock trades** — no buys, exits or trims. Spread exits still run
+(priced from live option quotes, risk-reducing). The flag is in the cycle result
+and the Discord report.
 
 ### 2.2 Backtest universe (legacy, biased)
 
@@ -129,7 +152,15 @@ score = 0.45 × (mom_12_1 / max(vol, 0.15))
 | G6 | Uptrend | `trend > 0` | `require_uptrend` |
 | G7 | Rank | top N by score | `top_n` |
 
-### 3.3 PEAD entry (SEC-sourced)
+> **Rebalance calendar.** Everything in §3.2 (ranking, G1 regime check, entries) and
+> the X_RANK / X_REGIME / X_TRIM exits in §4 run only on a rebalance cycle: no
+> rebalance recorded, `rebalance_days` (21) or more since the last, or the same
+> day as the last. Between rebalances the stock book is left alone, as in
+> `scripts/test_universe.py::momentum`. The last rebalance date is in
+> `state/rebalance.json`, written only by a live (non-dry-run) cycle with the
+> market open and fresh data.
+
+### 3.3 PEAD entry (SEC-sourced) — OFF
 
 Surprise is measured **two independent ways and both must agree**:
 
@@ -150,7 +181,7 @@ volume-confirmed overnight gap in the window ending at the filing date, and entr
 is the day **after**. This is deliberately conservative: the initial jump is never
 captured, only the drift — which is what PEAD actually is.
 
-### 3.4 Options overlay entry
+### 3.4 Options overlay entry — OFF for new spreads
 
 | # | Gate | Default | Config key |
 |---|---|---|---|
@@ -262,6 +293,10 @@ re-bought in full every cycle and the book churns for nothing.
 Exits are **never blocked** by exposure caps, position limits, or the cash floor —
 they reduce risk. `X_TRIM` sells only the excess; liquidating the whole position
 would have it bought straight back next cycle, paying costs both ways (§7.6).
+
+X_SPREAD_* exits are unconditional: they run every cycle, whether or not it is a
+rebalance cycle, whether or not the overlay is on, and even when prices are stale.
+X_PEAD_* exits only matter if the PEAD sleeve is turned back on.
 
 ---
 
@@ -424,6 +459,43 @@ call. The backtest models this explicitly (largest holding first, at that day's
 price). One occurrence across 5,638 sessions says the 15% collateral cap is sized
 sanely; a strategy that needed frequent forced sales would be mis-sized.
 
+### 6.7 THE DEPLOYED CONFIGURATION — momentum core only, monthly, 951 names
+
+`python scripts/run_deployed_config.py`. Top 6, 80% invested (20% cash), price
+≥ $10, 60-day vol ≤ 60%, 21-day rebalance, SPY-200 filter, 5 bps costs, 951
+mechanically-screened names including delisted ones, 2021-09-01 → 2026-08-27.
+Same engine as §6.4 (`scripts/test_universe.py::momentum`, with an `invest`
+fraction added).
+
+| Portfolio | Return | maxDD | Sharpe | β | α (ann) |
+|---|---|---|---|---|---|
+| SPY buy & hold | +70.7% | −25.4% | 0.60 | 1.00 | — |
+| Equal-weight 951 (bias control) | +59.8% | −25.3% | 0.50 | 0.98 | −1.0% |
+| **Deployed, first rebalance 2021-09-01** | **+196.5%** | −16.5% | 1.07 | 0.49 | +18.5% |
+
+**Sensitivity to the start day.** The result depends on where in the 21-day cycle
+the strategy happens to start. Shifting the first rebalance by 0–20 trading days
+(same end date):
+
+| Offset (trading days) | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Return | +196.5% | +161.6% | +161.5% | +199.5% | +155.1% | +117.6% | +116.3% | +125.2% | +121.4% | +128.4% | +145.2% |
+
+| Offset (trading days) | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Return | +135.3% | +141.1% | +183.9% | +185.1% | +150.2% | +153.9% | +213.9% | +206.3% | +164.5% | +126.6% |
+
+**Range +116.3% to +213.9%, median +153.9%.** Offset 0 is near the top of that
+range; +154% is the fairer central estimate. All 21 beat SPY (+70.7%) and the
+equal-weight control (+59.8%) over the same window.
+
+Reading it against §6.4: the 100%-invested, no-vol-cap, price ≥ $5 version of the
+same engine returns +329.2% (maxDD −38.2%, β 0.85, α +28.7%). The deployed
+filters and 20% cash cost return and buy a much shallower drawdown. **Neither is
+the 39-name headline** (§6.1–§6.3, §6.6): those tables are on a hand-picked
+universe with the overlay and PEAD sleeves running, and none of them describes
+what the account holds.
+
 ---
 
 ## 7. Optimization History and Key Learnings
@@ -464,6 +536,8 @@ earlier drafts is void.
 | Synthetic per-trade records in the tearsheet | fake 100% win rate, undefined PF | real trade records |
 | `TRIM` sold the whole position | $90k sold to reach a $50k target, re-bought next cycle | sells only the excess |
 | `is_delisted` had no staleness tolerance | **0 of 951** names scored — yesterday's bar looked delisted | 15-day tolerance |
+| Tolerance measured against the **wall clock**, cache never refreshed | 2026-09-14: all 951 names "delisted", ranking empty, every holding sold as "no longer in the top-N"; account in cash since | prices refresh each cycle; staleness guard fails closed; delisting measured from the newest SPY bar |
+| Rank exits ran on **every** cycle (3x a day) | a different, high-turnover strategy from the monthly one backtested | rebalance calendar (§3.2 note) |
 
 ### 7.7 Parameter findings that held up
 - **Any-day entry beats Monday-only**: PF 1.278 vs 1.185.
@@ -568,6 +642,24 @@ all refused.
 
 ## 10. Changelog
 
+- **2026-09-30** — **Stale-data liquidation fixed; live strategy now matches the
+  backtest.** Incident: the price cache (`data/broad`) was never refreshed (last bar
+  2026-08-27); on 2026-09-14 `is_delisted` tripped for all 951 names, the market-data
+  agent scored 0 candidates and the strategy agent sold every holding as "No longer
+  in the top-N momentum ranking". Also found: the live path exited any name outside
+  the top 6 on every cycle, while the backtest rebalances every 21 days.
+  Changes: (1) `refresh.py` refreshes prices before every cycle (finished sessions
+  only; full-history re-fetch on a split mismatch); (2) fail closed — no stock
+  trades if the newest SPY bar is more than 5 days old, `data_stale` event and flag
+  in the result and Discord report, delisting now relative to the newest SPY bar;
+  (3) monthly rebalance calendar, state in `state/rebalance.json`; (4) overlay and
+  PEAD off by default (1 of 22 overlay orders filled; PEAD has earnings data for
+  only 32 unrelated names). Spread exits are unchanged and unconditional.
+  Deployed-configuration backtest added (§6.7): +196.5% at start offset 0, range
+  +116% to +214% across 21 start days. Regression tests in `tests/test_agents.py`
+  and `tests/test_data_refresh.py`. The first refresh rewrote the full history of
+  AMC, APH (2:1 split), ENVX, LUMN, OPEN, QS and SAIL, whose cached prices were in
+  stale units.
 - **2026-08-28** — Adversarial review. Fixed `TRIM` liquidating whole positions and
   a quadratic `_align` (580ms → 2.6ms on 4k points). Verified: no look-ahead
   (scores bit-identical with future bars deleted), no PEAD event dated before it
